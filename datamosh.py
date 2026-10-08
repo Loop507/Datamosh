@@ -195,7 +195,8 @@ def finalize_h264(raw_path, audio_src, final_path, keep_audio, max_sec):
 # ----------------------------------------------------------------------------
 def audio_features(src, fps, n_frames, max_sec):
     """RMS + onset per frame normalizzati 0-1 (librosa). Zeri se manca l'audio."""
-    zeros = {"rms": np.zeros(n_frames), "onset": np.zeros(n_frames), "ok": False}
+    zeros = {"rms": np.zeros(n_frames), "onset": np.zeros(n_frames),
+             "beat": np.zeros(n_frames), "bpm": 0.0, "ok": False}
     wav = os.path.join(tempfile.mkdtemp(), "a.wav")
     try:
         subprocess.run([FFMPEG, "-y", "-i", src, "-t", str(max_sec), "-vn", "-ac", "1",
@@ -211,12 +212,20 @@ def audio_features(src, fps, n_frames, max_sec):
     onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
     ft = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
     vt = np.arange(n_frames) / fps
+    tempo, bt = librosa.beat.beat_track(onset_envelope=onset, sr=sr, hop_length=hop)
+    beat = np.zeros(n_frames)
+    for i, tb in enumerate(librosa.frames_to_time(bt, sr=sr, hop_length=hop)):
+        j = int(round(tb * fps))
+        if 0 <= j < n_frames:
+            beat[j] = 1.0 if i % 4 == 0 else 0.75  # accento sul battere (4/4)
 
     def norm(v):
         v = np.interp(vt, ft, v[:len(ft)])
+        v = np.where(vt <= ft[-1], v, 0.0)  # oltre la fine dell'audio: silenzio
         return np.clip(v / (np.percentile(v, 99) + 1e-9), 0, 1)
 
-    return {"rms": norm(rms), "onset": norm(onset), "ok": True}
+    return {"rms": norm(rms), "onset": norm(onset), "beat": beat,
+            "bpm": float(np.atleast_1d(tempo)[0]), "ok": True}
 
 
 # ----------------------------------------------------------------------------
@@ -346,6 +355,8 @@ VT = ["mp4", "mov", "avi", "mkv", "webm"]
 c1, c2 = st.columns(2)
 up_a = c1.file_uploader("Video A (movimento + audio) / motion + audio", type=VT, key="a")
 up_b = c2.file_uploader("Video B opzionale (texture, solo Optical Flow)", type=VT, key="b")
+up_au = st.file_uploader("Audio esterno opzionale (il tuo brano: guida il mosh e diventa la colonna sonora)",
+                         type=["wav", "mp3", "flac", "ogg", "m4a", "aac"], key="au")
 
 with st.sidebar:
     st.header("Comuni / Common")
@@ -353,35 +364,42 @@ with st.sidebar:
     mosh_range = st.slider("Finestra mosh / window (%)", 0, 100, (15, 100))
     max_w = st.select_slider("Larghezza max / Max width", [320, 480, 640, 854, 1280], 640)
     max_sec = st.slider("Durata max (s) / Max seconds", 2, 60, 15)
-    keep_audio = st.checkbox("Mantieni audio di A / Keep audio", True)
+    keep_audio = st.checkbox("Mantieni audio (A o esterno) / Keep audio", True)
     onset_thr = st.slider("Soglia onset / Onset threshold", 0.1, 1.0, 0.6, 0.05)
     bloom_prob = st.slider("Bloom casuale / Random bloom prob", 0.0, 0.3, 0.02, 0.01)
+    trigger = st.radio("Trigger audio", ["Onset", "Beat (a tempo)", "Onset + Beat"],
+                       help="Beat = scatti precisi sul tempo del brano (battere piu' forte).")
 
 
 def save_uploads():
     tmp = tempfile.mkdtemp()
     out = []
-    for up in (up_a, up_b):
+    for up in (up_a, up_b, up_au):
         if up is None:
             out.append(None); continue
         pth = os.path.join(tmp, up.name)
         with open(pth, "wb") as f:
             f.write(up.getbuffer())
         out.append(pth)
-    return tmp, out[0], out[1]
+    return tmp, out[0], out[1], out[2]
 
 
 def common():
     return {"seed": int(seed), "mosh_start": mosh_range[0], "mosh_end": mosh_range[1],
-            "max_w": int(max_w), "max_sec": int(max_sec), "onset_thr": onset_thr,
+            "max_w": int(max_w), "max_sec": int(max_sec), "onset_thr": onset_thr, "trigger": trigger,
             "bloom_prob": bloom_prob}
 
 
-def au_for(pa):
+def au_for(pa, pau=None):
     cap = cv2.VideoCapture(pa)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     cap.release()
-    return audio_features(pa, fps, int(max_sec * fps) + 2, max_sec)
+    au = audio_features(pau or pa, fps, int(max_sec * fps) + 2, max_sec)
+    if trigger == "Beat (a tempo)":
+        au["onset"] = au["beat"]
+    elif trigger == "Onset + Beat":
+        au["onset"] = np.maximum(au["onset"], au["beat"])
+    return au
 
 
 def publish(final, rep):
@@ -404,16 +422,16 @@ with tab1:
     quiet_thr = a.slider("Soglia quiete (recupero sync) / Quiet thr", 0.0, 0.6, 0.25, 0.05)
     go1 = st.button("GENERA BYTE / GENERATE", type="primary", disabled=up_a is None)
     if go1 and up_a is not None:
-        tmp, pa, _ = save_uploads()
+        tmp, pa, _, pau = save_uploads()
         try:
             p = {**common(), "kf": kf, "qscale": qscale, "drop_mode": drop_mode,
                  "drop_thr": drop_thr, "max_dup": max_dup, "corrupt": corrupt,
                  "quiet_thr": quiet_thr}
-            p["au"] = au_for(pa)
+            p["au"] = au_for(pa, pau)
             avi, final = os.path.join(tmp, "mosh.avi"), os.path.join(tmp, "out.mp4")
             with st.spinner("Moshing bytes..."):
                 fps, stt = byte_datamosh(pa, avi, p)
-                finalize_h264(avi, pa, final, keep_audio, max_sec)
+                finalize_h264(avi, pau or pa, final, keep_audio, max_sec)
             publish(final, ("BYTE", p, fps, stt, p["au"]["ok"]))
         except Exception as e:  # noqa: BLE001
             st.error(f"Errore / Error :: {e}")
@@ -435,7 +453,7 @@ with tab2:
     refresh_thr = a.slider("Soglia refresh / Refresh thr", 0.5, 1.0, 0.85, 0.05)
     go2 = st.button("GENERA OPTICAL / GENERATE", type="primary", disabled=up_a is None)
     if go2 and up_a is not None:
-        tmp, pa, pb = save_uploads()
+        tmp, pa, pb, pau = save_uploads()
         try:
             p = {**common(), "mode": mode, "block": int(block), "strength": strength,
                  "mv_noise": mv_noise, "iframe_every": 0, "iframe_prob": 0.0,
@@ -443,11 +461,11 @@ with tab2:
                  "bloom_len": (int(bloom_len[0]), int(bloom_len[1])), "residual": residual,
                  "a_strength": a_strength, "a_bloom": a_bloom, "a_refresh": a_refresh,
                  "refresh_thr": refresh_thr}
-            p["au"] = au_for(pa)
+            p["au"] = au_for(pa, pau)
             raw, final = os.path.join(tmp, "raw.mp4"), os.path.join(tmp, "out.mp4")
             bar = st.progress(0.0)
             fps, stt = datamosh_video(pa, pb, raw, p, progress_cb=lambda v: bar.progress(min(1.0, v)))
-            finalize_h264(raw, pa, final, keep_audio, max_sec)
+            finalize_h264(raw, pau or pa, final, keep_audio, max_sec)
             bar.empty()
             publish(final, ("OPTICAL", p, fps, stt, p["au"]["ok"]))
         except Exception as e:  # noqa: BLE001
@@ -462,6 +480,7 @@ if st.session_state["dm_out"] is not None:
              f"seed :: {p['seed']}  fps :: {fps:.2f}",
              f"finestra / window :: {p['mosh_start']}% -> {p['mosh_end']}%",
              f"audio-reactive :: {'si / yes' if au_ok else 'no (audio assente / missing)'}"]
+    lines.append(f"trigger :: {p.get('trigger', 'Onset')}  bpm :: {p['au'].get('bpm', 0):.1f}")
     lines += [f"{k} :: {v}" for k, v in stt.items()]
     lines.append("dsp :: " + ("AVI/MPEG-4 byte-level" if kind == "BYTE" else "OpenCV Farneback + remap")
                  + " + librosa :: no AI")
