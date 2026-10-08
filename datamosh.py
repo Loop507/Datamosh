@@ -348,8 +348,52 @@ def byte_datamosh(src, out_avi, p):
 st.set_page_config(page_title="DATAMOSH // Loop507", layout="wide")
 st.title("DATAMOSH // Loop507")
 st.caption("Minimalismo Computazionale / Glitch Brutalista :: audio-reactive :: puro DSP, nessuna AI")
-for key in ("dm_out", "dm_report"):
-    st.session_state.setdefault(key, None)
+
+DEFAULTS = {
+    "seed": 507, "mosh_range": (15, 100), "max_w": 640, "max_sec": 15, "keep_audio": True,
+    "onset_thr": 0.6, "bloom_prob": 0.02, "trigger": "Onset",
+    "kf": 12, "qscale": 5, "drop_mode": "Su onset", "drop_thr": 0.5, "max_dup": 12,
+    "corrupt": 0.002, "quiet_thr": 0.25,
+    "mode": "Block MV", "block": 16, "strength": 1.5, "mv_noise": 0.0, "hold_prob": 0.05,
+    "bloom_gain": 2.5, "bloom_len": (6, 24), "residual": 0.0, "a_strength": 1.0,
+    "a_bloom": True, "a_refresh": False, "refresh_thr": 0.85,
+}
+KEEP = ("seed", "max_w", "max_sec", "keep_audio")  # i preset non li toccano
+MANUAL = "— manuale —"
+PRESETS = {
+    "Glitch ritmico a tempo": ("Tab 1 Byte :: i colpi tolgono gli I-frame e spalmano il movimento, a tempo col brano.",
+        {"trigger": "Beat (a tempo)", "kf": 8, "drop_mode": "Su onset", "max_dup": 12, "corrupt": 0.001}),
+    "Caos totale": ("Tab 1 Byte :: mosh continuo e corruzione pesante.",
+        {"drop_mode": "Tutti", "max_dup": 25, "corrupt": 0.005, "qscale": 8}),
+    "Minimale": ("Tab 1 Byte :: pochi duplicati sugli attacchi forti, quasi nessuna corruzione. Effetto sottile.",
+        {"drop_mode": "Su onset", "drop_thr": 0.7, "max_dup": 6, "corrupt": 0.0, "onset_thr": 0.7}),
+    "Liquido e morbido": ("Tab 2 Optical :: deformazioni fluide, l'immagine resta leggibile.",
+        {"mode": "Optical Flow", "strength": 1.0, "residual": 0.1, "a_strength": 1.5, "hold_prob": 0.0}),
+    "Codec rotto": ("Tab 2 Optical :: macro-blocchi che sbandano a ogni colpo.",
+        {"mode": "Block MV", "block": 32, "strength": 2.0, "mv_noise": 2.0, "a_bloom": True}),
+    "Mosh a ondate": ("Tab 2 Optical :: il movimento si accumula, sui colpi forti l'immagine si rinfresca. A ondate col brano.",
+        {"trigger": "Beat (a tempo)", "a_refresh": True, "refresh_thr": 0.9, "bloom_len": (8, 30)}),
+    "Un video mangia l'altro": ("Tab 2 Optical :: carica Video A e Video B: il movimento di A deforma l'immagine di B.",
+        {"mode": "Block MV", "block": 16, "mosh_range": (0, 100), "residual": 0.0}),
+}
+for _k, _v in DEFAULTS.items():
+    st.session_state.setdefault(_k, _v)
+for _k, _v in (("preset", MANUAL), ("dm_out", None), ("dm_report", None)):
+    st.session_state.setdefault(_k, _v)
+
+
+def apply_preset():
+    name = st.session_state["preset"]
+    if name in PRESETS:
+        for k, v in {**DEFAULTS, **PRESETS[name][1]}.items():
+            if k not in KEEP:
+                st.session_state[k] = v
+
+
+st.selectbox("Preset (riporta i controlli ai valori del preset, poi puoi ritoccarli)",
+             [MANUAL] + list(PRESETS), key="preset", on_change=apply_preset)
+if st.session_state["preset"] in PRESETS:
+    st.caption(PRESETS[st.session_state["preset"]][0])
 
 VT = ["mp4", "mov", "avi", "mkv", "webm"]
 c1, c2 = st.columns(2)
@@ -360,14 +404,14 @@ up_au = st.file_uploader("Audio esterno opzionale (il tuo brano: guida il mosh e
 
 with st.sidebar:
     st.header("Comuni / Common")
-    seed = st.number_input("Seed", 0, 2**31 - 1, 507)
-    mosh_range = st.slider("Finestra mosh / window (%)", 0, 100, (15, 100))
-    max_w = st.select_slider("Larghezza max / Max width", [320, 480, 640, 854, 1280], 640)
-    max_sec = st.slider("Durata max (s) / Max seconds", 2, 60, 15)
-    keep_audio = st.checkbox("Mantieni audio (A o esterno) / Keep audio", True)
-    onset_thr = st.slider("Soglia onset / Onset threshold", 0.1, 1.0, 0.6, 0.05)
-    bloom_prob = st.slider("Bloom casuale / Random bloom prob", 0.0, 0.3, 0.02, 0.01)
-    trigger = st.radio("Trigger audio", ["Onset", "Beat (a tempo)", "Onset + Beat"],
+    seed = st.number_input("Seed", 0, 2**31 - 1, key="seed")
+    mosh_range = st.slider("Finestra mosh / window (%)", 0, 100, key="mosh_range")
+    max_w = st.select_slider("Larghezza max / Max width", [320, 480, 640, 854, 1280], key="max_w")
+    max_sec = st.slider("Durata max (s) / Max seconds", 2, 60, key="max_sec")
+    keep_audio = st.checkbox("Mantieni audio (A o esterno) / Keep audio", key="keep_audio")
+    onset_thr = st.slider("Soglia onset / Onset threshold", 0.1, 1.0, step=0.05, key="onset_thr")
+    bloom_prob = st.slider("Bloom casuale / Random bloom prob", 0.0, 0.3, step=0.01, key="bloom_prob")
+    trigger = st.radio("Trigger audio", ["Onset", "Beat (a tempo)", "Onset + Beat"], key="trigger",
                        help="Beat = scatti precisi sul tempo del brano (battere piu' forte).")
 
 
@@ -413,13 +457,13 @@ tab1, tab2 = st.tabs(["1 // BYTE (AVI)", "2 // OPTICAL FLOW"])
 with tab1:
     st.write("Elimina I-frame, duplica P-frame e corrompe byte :: guidato dall'audio.")
     a, b, c = st.columns(3)
-    kf = a.slider("Keyframe ogni N / Keyframe every N", 6, 120, 12)
-    qscale = a.slider("Qualita' (basso = migliore) / q-scale", 2, 15, 5)
-    drop_mode = b.radio("Elimina I-frame / Drop I-frames", ["Su onset", "Tutti", "Mai"])
-    drop_thr = b.slider("Soglia drop I / Drop threshold", 0.1, 1.0, 0.5, 0.05)
-    max_dup = c.slider("Max duplicati P per onset / Max P dups", 1, 40, 12)
-    corrupt = c.slider("Corruzione byte / Byte corruption", 0.0, 0.01, 0.002, 0.0005, format="%.4f")
-    quiet_thr = a.slider("Soglia quiete (recupero sync) / Quiet thr", 0.0, 0.6, 0.25, 0.05)
+    kf = a.slider("Keyframe ogni N / Keyframe every N", 6, 120, key="kf")
+    qscale = a.slider("Qualita' (basso = migliore) / q-scale", 2, 15, key="qscale")
+    quiet_thr = a.slider("Soglia quiete (recupero sync) / Quiet thr", 0.0, 0.6, step=0.05, key="quiet_thr")
+    drop_mode = b.radio("Elimina I-frame / Drop I-frames", ["Su onset", "Tutti", "Mai"], key="drop_mode")
+    drop_thr = b.slider("Soglia drop I / Drop threshold", 0.1, 1.0, step=0.05, key="drop_thr")
+    max_dup = c.slider("Max duplicati P per onset / Max P dups", 1, 40, key="max_dup")
+    corrupt = c.slider("Corruzione byte / Byte corruption", 0.0, 0.01, step=0.0005, format="%.4f", key="corrupt")
     go1 = st.button("GENERA BYTE / GENERATE", type="primary", disabled=up_a is None)
     if go1 and up_a is not None:
         tmp, pa, _, pau = save_uploads()
@@ -439,18 +483,18 @@ with tab1:
 with tab2:
     st.write("Optical flow Farneback :: transfer A->B opzionale :: guidato dall'audio.")
     a, b, c = st.columns(3)
-    mode = a.radio("Modo / Mode", ["Block MV", "Optical Flow"])
-    block = a.select_slider("Blocco / Block", [8, 16, 32, 64], 16)
-    strength = b.slider("Forza / Strength", 0.2, 4.0, 1.5, 0.1)
-    mv_noise = b.slider("Rumore MV / MV noise", 0.0, 8.0, 0.0, 0.5)
-    hold_prob = b.slider("Hold prob", 0.0, 0.5, 0.05, 0.01)
-    bloom_gain = c.slider("Bloom gain", 1.0, 5.0, 2.5, 0.1)
-    bloom_len = c.slider("Bloom durata / length", 2, 60, (6, 24))
-    residual = c.slider("Residuo / Leak", 0.0, 0.5, 0.0, 0.01)
-    a_strength = a.slider("RMS -> forza / strength", 0.0, 3.0, 1.0, 0.1)
-    a_bloom = a.checkbox("Onset -> bloom", True)
-    a_refresh = a.checkbox("Onset forte -> I-frame / strong onset refresh", False)
-    refresh_thr = a.slider("Soglia refresh / Refresh thr", 0.5, 1.0, 0.85, 0.05)
+    mode = a.radio("Modo / Mode", ["Block MV", "Optical Flow"], key="mode")
+    block = a.select_slider("Blocco / Block", [8, 16, 32, 64], key="block")
+    a_strength = a.slider("RMS -> forza / strength", 0.0, 3.0, step=0.1, key="a_strength")
+    a_bloom = a.checkbox("Onset -> bloom", key="a_bloom")
+    a_refresh = a.checkbox("Onset forte -> I-frame / strong onset refresh", key="a_refresh")
+    refresh_thr = a.slider("Soglia refresh / Refresh thr", 0.5, 1.0, step=0.05, key="refresh_thr")
+    strength = b.slider("Forza / Strength", 0.2, 4.0, step=0.1, key="strength")
+    mv_noise = b.slider("Rumore MV / MV noise", 0.0, 8.0, step=0.5, key="mv_noise")
+    hold_prob = b.slider("Hold prob", 0.0, 0.5, step=0.01, key="hold_prob")
+    bloom_gain = c.slider("Bloom gain", 1.0, 5.0, step=0.1, key="bloom_gain")
+    bloom_len = c.slider("Bloom durata / length", 2, 60, key="bloom_len")
+    residual = c.slider("Residuo / Leak", 0.0, 0.5, step=0.01, key="residual")
     go2 = st.button("GENERA OPTICAL / GENERATE", type="primary", disabled=up_a is None)
     if go2 and up_a is not None:
         tmp, pa, pb, pau = save_uploads()
@@ -477,6 +521,7 @@ if st.session_state["dm_out"] is not None:
                        file_name="datamosh_loop507.mp4", mime="video/mp4")
     kind, p, fps, stt, au_ok = st.session_state["dm_report"]
     lines = ["DATAMOSH REPORT // LOOP507", f"approccio / approach :: {kind}",
+             f"preset :: {st.session_state['preset']}",
              f"seed :: {p['seed']}  fps :: {fps:.2f}",
              f"finestra / window :: {p['mosh_start']}% -> {p['mosh_end']}%",
              f"audio-reactive :: {'si / yes' if au_ok else 'no (audio assente / missing)'}"]
