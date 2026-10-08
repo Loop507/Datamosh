@@ -21,6 +21,7 @@ import tempfile
 import cv2
 import librosa
 import numpy as np
+from scipy.signal import lfilter
 import streamlit as st
 
 try:
@@ -204,7 +205,7 @@ def zero_au(n):
     keys = ("rms", "onset", "beat", "low", "mid", "high", "trig_bloom", "trig_drop",
             "trig_refresh", "corr", "noise")
     au = {k: np.zeros(n) for k in keys}
-    au.update({"bpm": 0.0, "ok": False})
+    au.update({"bpm": 0.0, "ok": False, "dur": 0.0})
     return au
 
 
@@ -252,7 +253,8 @@ def audio_features(src, fps, n_frames, max_sec, bpm_manual=0.0, accent=4):
             beat[j] = 1.0 if i % accent == 0 else 0.75  # accento sul primo battito
     au = zero_au(n_frames)
     au.update({"rms": norm(rms), "onset": norm(onset), "beat": beat, "bpm": bpm, "ok": True,
-               "low": band(0, 150), "mid": band(150, 2000), "high": band(2000, sr / 2)})
+               "low": band(0, 150), "mid": band(150, 2000), "high": band(2000, sr / 2),
+               "dur": float(ft[-1])})
     return au
 
 
@@ -434,10 +436,148 @@ def byte_datamosh(src, src_b, out_avi, p):
     return fps, st
 
 
+# ----------------------------------------------------------------------------
+# DATABENDING: pixel -> segnale -> effetti "audio" -> pixel (come Audacity, ma controllabile)
+# ----------------------------------------------------------------------------
+FX = ("echo", "reverb", "invert", "burn", "crush", "hp", "dist", "slip")
+DRIVERS = ["Fisso", "Volume", "Bassi", "Medi", "Acuti", "Colpi/Beat"]
+FX_IT = {"echo": "eco", "reverb": "riverbero", "invert": "inverti", "burn": "amplifica",
+         "crush": "bitcrush", "hp": "passa-alto", "dist": "distorsione", "slip": "slittamento"}
+FX_EN = {"echo": "echo", "reverb": "reverb", "invert": "invert", "burn": "amplify",
+         "crush": "bitcrush", "hp": "high-pass", "dist": "distortion", "slip": "byte slip"}
+
+
+def envelope(sig, decay):
+    out, e = np.zeros(len(sig)), 0.0
+    for i, v in enumerate(sig):
+        e = max(float(v), e * decay)
+        out[i] = e
+    return out
+
+
+def driver_env(au, name, decay):
+    key = {"Volume": "rms", "Bassi": "low", "Medi": "mid", "Acuti": "high", "Colpi/Beat": "onset"}.get(name)
+    return None if key is None else envelope(au[key], decay)
+
+
+def bend_frame(frame, amt, p, rng):
+    """Il frame (BGR) e' un segnale di byte centrato a 127.5: ci applico gli effetti e lo riconverto."""
+    h, w = frame.shape[:2]
+    rb = w * 3
+    r0, r1 = int(h * p["zone"][0] / 100), int(h * p["zone"][1] / 100)
+    if r1 - r0 < 2:
+        return frame
+    out = frame.copy()
+    flat = out.reshape(-1)
+    a = (flat[r0 * rb:r1 * rb].astype(np.float32) - 127.5) / 127.5
+    n = a.size
+
+    def bands(k, frac):
+        for _ in range(k):
+            hgt = max(1, int((r1 - r0) * frac))
+            y0 = int(rng.integers(0, max(1, r1 - r0 - hgt)))
+            yield y0 * rb, min(n, (y0 + hgt) * rb)
+
+    if amt["slip"] > 0.03:  # cancella k byte: tutto il resto scivola
+        k = int(amt["slip"] * 90) + 1
+        for _ in range(1 + int(2 * amt["slip"])):
+            pos = int(rng.integers(0, max(1, n - k)))
+            a = np.concatenate([a[:pos], a[pos + k:], np.zeros(k, np.float32)])
+    if amt["echo"] > 0.03:
+        g = 0.85 * amt["echo"]
+        d = max(3, int(p["delay"] * w) * 3 if p["align"] else int(p["delay"] * rb))
+        y, norm = a.copy(), 1.0
+        for k in (1, 2, 3):
+            s = k * d
+            if s < n:
+                y[s:] += (g ** k) * a[:-s]
+                norm += g ** k
+        a = y / norm
+    if amt["reverb"] > 0.03:  # coda esponenziale: pixel trascinati come vernice
+        al = 0.5 + 0.485 * amt["reverb"]
+        wet = lfilter([1 - al], [1, -al], a).astype(np.float32)
+        a = a * (1 - amt["reverb"]) + wet * amt["reverb"]
+    if amt["hp"] > 0.03:  # passa-alto: solo i bordi
+        low = lfilter([0.1], [1, -0.9], a).astype(np.float32)
+        a = a * (1 - amt["hp"]) + (a - low) * 2 * amt["hp"]
+    if amt["dist"] > 0.03:
+        drive = 1 + 14 * amt["dist"]
+        a = np.tanh(drive * a) / np.tanh(drive)
+    if amt["burn"] > 0.03:  # amplificazione con fade dentro fasce di righe
+        g = 1 + 7 * amt["burn"]
+        for s0, s1 in bands(1 + int(3 * amt["burn"]), 0.05 + 0.25 * amt["burn"]):
+            a[s0:s1] = np.clip(a[s0:s1] * np.linspace(1, g, s1 - s0, dtype=np.float32), -1, 1)
+    if amt["invert"] > 0.05:  # inverti polarita' = negativo a fasce
+        for s0, s1 in bands(1 + int(3 * amt["invert"]), 0.04 + 0.2 * amt["invert"]):
+            a[s0:s1] *= -1
+    if amt["crush"] > 0.03:
+        lv = 2 + int(30 * (1 - amt["crush"]))
+        a = np.round(a * lv) / lv
+        if amt["crush"] > 0.3:
+            k = 3 * (1 + int(amt["crush"] * 10))
+            a = np.repeat(a[::k], k)[:n]
+    flat[r0 * rb:r1 * rb] = np.clip(a * 127.5 + 127.5, 0, 255).astype(np.uint8)
+    return out
+
+
+def databend_video(src_video, src_image, out_path, p, progress_cb=None):
+    """Sorgente: un video oppure un'immagine fissa che si anima col brano (serve l'audio)."""
+    rng = np.random.default_rng(p["seed"])
+    au, cap = p["au"], None
+    if src_image:
+        img = cv2.imread(src_image)
+        if img is None:
+            raise RuntimeError("Immagine non leggibile / unreadable image")
+        fps = float(p["fps_img"])
+        oh, ow = img.shape[:2]
+        n = min(int(p["max_sec"] * fps), int(au["dur"] * fps))
+    else:
+        cap = cv2.VideoCapture(src_video)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        ow, oh = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        n = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1, int(p["max_sec"] * fps))
+    if n < 2:
+        raise RuntimeError("Audio o video troppo corto / source too short")
+    scale = min(1.0, p["max_w"] / float(ow))
+    w, h = max(16, int(ow * scale) // 2 * 2), max(16, int(oh * scale) // 2 * 2)
+    if src_image:
+        img = fit_frame(img, w, h)
+    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    env = {k: driver_env(au, p["db_drv"][k], p["release"]) for k in FX}
+    start_f, end_f = int(n * p["mosh_start"] / 100), int(n * p["mosh_end"] / 100)
+    prev, bent, done = None, 0, 0
+    for t in range(n):
+        if src_image:
+            frame = img
+        else:
+            ok, fr = cap.read()
+            if not ok:
+                break
+            frame = fit_frame(fr, w, h)
+        if start_f <= t < end_f:
+            amt = {k: min(1.0, p["db_fx"][k] * (1.0 if env[k] is None else at(env[k], t))) for k in FX}
+            base = frame if prev is None or p["mem"] <= 0 else \
+                cv2.addWeighted(frame, 1 - p["mem"], prev, p["mem"], 0)
+            out = bend_frame(base, amt, p, rng)
+            prev, bent = out, bent + 1
+        else:
+            out, prev = frame, None
+        writer.write(out)
+        done += 1
+        if progress_cb and t % 5 == 0:
+            progress_cb(t / max(1, n - 1))
+    writer.release()
+    if cap is not None:
+        cap.release()
+    return fps, {"frames": done, "bent": bent, "source": "image" if src_image else "video",
+                 "fx": dict(p["db_fx"])}
+
+
 PRESET_EN = {"Manuale": "Manual", "Glitch ritmico a tempo": "Rhythmic Glitch", "Caos totale": "Total Chaos",
              "Minimale": "Minimal", "Liquido e morbido": "Liquid & Soft", "Codec rotto": "Broken Codec",
              "Mosh a ondate": "Wave Mosh", "Un video mangia l'altro": "One Video Eats the Other",
-             "Cassa, rullante, hi-hat": "Kick, Snare, Hi-hat"}
+             "Cassa, rullante, hi-hat": "Kick, Snare, Hi-hat", "Vernice fresca": "Fresh Paint",
+             "Schermo bruciato": "Burnt Screen", "Fantasma a righe": "Striped Ghost"}
 TRIG_EN = {"Onset": "Onset", "Beat (a tempo)": "Beat (tempo-locked)", "Onset + Beat": "Onset + Beat"}
 
 
@@ -469,24 +609,31 @@ def build_report(kind, p, fps, stt, au_ok, preset, num):
                      ("Corrupt", stt["corrupt"]), ("Keyframe Audio", stt["kf_audio"]),
                      ("Transfer", yn(stt["transfer"]))]
             dsp = "AVI/MPEG-4 byte-level + librosa"
-        else:
+        elif kind == "OPTICAL":
             rows += [("Modo" if it else "Mode", p["mode"]), ("Motore flow" if it else "Flow engine", eng),
                      ("I-frame", stt["iframes"]), ("Hold", stt["holds"]), ("Bloom", stt["blooms"]),
                      ("Transfer", yn(stt["transfer"]))]
             dsp = f"OpenCV {eng} optical flow + librosa"
+        else:
+            nm = FX_IT if it else FX_EN
+            fx = ", ".join(f"{nm[k]} {v:.2f}" for k, v in stt["fx"].items() if v > 0)
+            src = "Video" if stt["source"] == "video" else ("Immagine" if it else "Still image")
+            rows += [("Sorgente" if it else "Source", src), ("Effetti" if it else "Effects", fx or "-"),
+                     ("Frame piegati" if it else "Bent frames", stt["bent"])]
+            dsp = "NumPy/SciPy signal databending + librosa"
         out = [f"DATAMOSH // N.{num:03d}"] + [f"{k} :: {v}" for k, v in rows]
         return out + [f"DSP :: {dsp}", "Nessun Modello AI/neurale" if it else "No AI/Neural Models",
                       "Direction & Algorithm :: Loop507"]
 
-    mid = ["byte"] if byte else ["opticalflow"]
-    end = ["mpeg4", "avi"] if byte else ["opencv", "motionvectors"]
+    mid = {"BYTE": ["byte"], "OPTICAL": ["opticalflow"], "DATABEND": ["databending"]}[kind]
+    end = {"BYTE": ["mpeg4", "avi"], "OPTICAL": ["opencv", "motionvectors"], "DATABEND": ["numpy", "scipy"]}[kind]
     hashtags = ["datamosh", "loop507"] + mid + ["glitchart", "noai", "generativeaudio", "sounddesign",
         "aftereffects", "motiondesign", "algorithmicart", f"seed{seed}", "proceduralart", "digitalart",
         "experimentalvideo", "experimentalsound", "librosa"] + end + ["datamoshing", "compressionart"]
-    yt = ["datamosh", "loop507", "byte" if byte else "optical flow", "glitch art", "no ai", "generative audio",
+    yt = ["datamosh", "loop507", {"BYTE": "byte", "OPTICAL": "optical flow", "DATABEND": "databending"}[kind], "glitch art", "no ai", "generative audio",
           "sound design", "after effects", "motion design", "algorithmic art", f"seed {seed}", "procedural art",
           "digital art", "experimental video", "experimental sound", "librosa"] + \
-         (["mpeg-4", "avi"] if byte else ["opencv", "motion vectors"]) + ["datamoshing", "compression art"]
+         {"BYTE": ["mpeg-4", "avi"], "OPTICAL": ["opencv", "motion vectors"], "DATABEND": ["numpy", "scipy"]}[kind] + ["datamoshing", "compression art"]
     sep = "=" * 40
     return "\n".join([sep, "[ ITALIANO ]", sep, *block("it"), "", sep, "[ ENGLISH ]", sep, *block("en"), "",
                       " ".join("#" + t for t in hashtags), "", sep, "[ TAG YOUTUBE — ENGLISH ONLY ]", sep,
@@ -510,17 +657,24 @@ DEFAULTS = {
     "mode": "Block MV", "block": 16, "strength": 1.5, "mv_noise": 0.0, "hold_prob": 0.05,
     "bloom_gain": 2.5, "bloom_len": (6, 24), "residual": 0.0, "a_strength": 1.0,
     "a_bloom": True, "a_refresh": False, "refresh_thr": 0.85,
+    "db_echo": 0.5, "db_reverb": 0.4, "db_invert": 0.3, "db_burn": 0.3, "db_crush": 0.2, "db_hp": 0.0,
+    "db_dist": 0.0, "db_slip": 0.0,
+    "db_d_echo": "Bassi", "db_d_reverb": "Volume", "db_d_invert": "Colpi/Beat", "db_d_burn": "Medi",
+    "db_d_crush": "Acuti", "db_d_hp": "Acuti", "db_d_dist": "Volume", "db_d_slip": "Colpi/Beat",
+    "db_delay": 0.37, "db_align": False, "db_release": 0.8, "db_mem": 0.0, "db_zone": (0, 100), "db_fps": 30,
 }
 KEEP = ("seed", "max_w", "max_sec", "prev_sec", "keep_audio", "bpm_manual", "meter", "flow_engine")
 OPTS = {"trigger": ["Onset", "Beat (a tempo)", "Onset + Beat"], "drop_mode": ["Su onset", "Tutti", "Mai"],
         "mode": ["Block MV", "Optical Flow"], "block": [8, 16, 32, 64], "meter": list(ACC),
-        "max_w": [320, 480, 640, 854, 1280], "flow_engine": ["DIS (veloce)", "Farneback"]}
+        "max_w": [320, 480, 640, 854, 1280], "flow_engine": ["DIS (veloce)", "Farneback"], "db_fps": [24, 25, 30],
+        **{"db_d_" + k: DRIVERS for k in FX}}
 LIM = {"seed": (0, 2**31 - 1), "mosh_range": (0, 100), "max_sec": (2, 180), "prev_sec": (2, 6),
        "onset_thr": (0.1, 1.0), "bloom_prob": (0.0, 0.3), "bpm_manual": (0.0, 300.0),
        "kf": (6, 120), "qscale": (2, 15), "drop_thr": (0.1, 1.0), "max_dup": (1, 40),
        "corrupt": (0.0, 0.01), "quiet_thr": (0.0, 0.6), "strength": (0.2, 4.0), "mv_noise": (0.0, 8.0),
        "hold_prob": (0.0, 0.5), "bloom_gain": (1.0, 5.0), "bloom_len": (2, 60), "residual": (0.0, 0.5),
-       "a_strength": (0.0, 3.0), "refresh_thr": (0.5, 1.0)}
+       "a_strength": (0.0, 3.0), "refresh_thr": (0.5, 1.0), "db_delay": (0.01, 1.5), "db_release": (0.0, 0.95),
+       "db_mem": (0.0, 0.95), "db_zone": (0, 100), **{"db_" + k: (0.0, 1.0) for k in FX}}
 MANUAL = "— manuale —"
 PRESETS = {
     "Glitch ritmico a tempo": ("Tab 1 Byte :: i colpi tolgono gli I-frame e spalmano il movimento, a tempo col brano.",
@@ -537,6 +691,15 @@ PRESETS = {
         {"trigger": "Beat (a tempo)", "a_refresh": True, "refresh_thr": 0.9, "bloom_len": (8, 30)}),
     "Un video mangia l'altro": ("Tab 1 o 2 :: carica Video A (movimento) e Video B (immagine): A deforma B.",
         {"mode": "Block MV", "block": 16, "mosh_range": (0, 100), "residual": 0.0}),
+    "Vernice fresca": ("Tab 3 Databending :: pixel trascinati come vernice fresca, a ritmo di volume.",
+        {"db_reverb": 0.9, "db_echo": 0.2, "db_invert": 0.0, "db_burn": 0.0, "db_crush": 0.0,
+         "db_release": 0.9, "db_mem": 0.5}),
+    "Schermo bruciato": ("Tab 3 Databending :: luminosita' bruciata, negativi a fasce e distorsione sui colpi.",
+        {"db_burn": 0.9, "db_dist": 0.7, "db_invert": 0.6, "db_echo": 0.0, "db_reverb": 0.1, "db_crush": 0.0,
+         "db_d_burn": "Bassi", "db_d_invert": "Colpi/Beat"}),
+    "Fantasma a righe": ("Tab 3 Databending :: sdoppiamenti diagonali e bordi: ghosting a righe.",
+        {"db_echo": 0.9, "db_hp": 0.6, "db_delay": 0.33, "db_reverb": 0.0, "db_invert": 0.0, "db_burn": 0.0,
+         "db_crush": 0.0, "db_d_echo": "Volume"}),
     "Cassa, rullante, hi-hat": ("Tab 1 Byte :: modo bande: la cassa toglie gli I-frame, il rullante rinfresca, gli hi-hat corrompono.",
         {"bands": True, "drop_mode": "Su onset", "corrupt": 0.003, "max_dup": 14, "kf": 8}),
 }
@@ -609,6 +772,8 @@ up_a = c1.file_uploader("Video A (movimento + audio) / motion + audio", type=VT,
 up_b = c2.file_uploader("Video B opzionale (immagine/texture che A deforma)", type=VT, key="b")
 up_au = st.file_uploader("Audio esterno opzionale (il tuo brano: guida il mosh e diventa la colonna sonora)",
                          type=["wav", "mp3", "flac", "ogg", "m4a", "aac"], key="au")
+up_img = st.file_uploader("Immagine fissa opzionale (solo tab 3 Databending: si anima col brano, serve l'audio esterno)",
+                          type=["png", "jpg", "jpeg", "bmp", "webp"], key="img")
 
 with st.sidebar:
     st.header("Comuni / Common")
@@ -642,7 +807,7 @@ with st.sidebar:
 def save_uploads():
     tmp = tempfile.mkdtemp()
     out = []
-    for up in (up_a, up_b, up_au):
+    for up in (up_a, up_b, up_au, up_img):
         if up is None:
             out.append(None)
             continue
@@ -650,7 +815,7 @@ def save_uploads():
         with open(pth, "wb") as f:
             f.write(up.getbuffer())
         out.append(pth)
-    return tmp, out[0], out[1], out[2]
+    return tmp, out[0], out[1], out[2], out[3]
 
 
 def common(preview=False):
@@ -661,10 +826,11 @@ def common(preview=False):
             "bands": bands, "bpm_manual": float(bpm_manual), "meter": meter}
 
 
-def au_for(pa, pau, msec):
-    cap = cv2.VideoCapture(pa)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    cap.release()
+def au_for(pa, pau, msec, fps=None):
+    if fps is None:
+        cap = cv2.VideoCapture(pa)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        cap.release()
     au = audio_features(pau or pa, fps, int(msec * fps) + 2, msec, float(bpm_manual), ACC[meter])
     return route_audio(au, trigger, bands)
 
@@ -685,7 +851,7 @@ def finish(ok, preview):
 
 
 def run_byte(preview):
-    tmp, pa, pb, pau = save_uploads()
+    tmp, pa, pb, pau, _i = save_uploads()
     try:
         p = {**common(preview), "kf": kf, "qscale": qscale, "drop_mode": drop_mode,
              "drop_thr": drop_thr, "max_dup": max_dup, "corrupt": corrupt,
@@ -703,7 +869,7 @@ def run_byte(preview):
 
 
 def run_optical(preview):
-    tmp, pa, pb, pau = save_uploads()
+    tmp, pa, pb, pau, _i = save_uploads()
     try:
         p = {**common(preview), "mode": mode, "block": int(block), "strength": strength,
              "mv_noise": mv_noise, "iframe_every": 0, "iframe_prob": 0.0,
@@ -725,7 +891,32 @@ def run_optical(preview):
         return False
 
 
-tab1, tab2 = st.tabs(["1 // BYTE (AVI)", "2 // OPTICAL FLOW"])
+def run_databend(preview):
+    tmp, pa, _, pau, pi = save_uploads()
+    try:
+        if pi and not pau:
+            raise RuntimeError("Per animare l'immagine serve un audio esterno / an audio file is required")
+        p = {**common(preview), "db_fx": {k: st.session_state["db_" + k] for k in FX},
+             "db_drv": {k: st.session_state["db_d_" + k] for k in FX}, "delay": st.session_state["db_delay"],
+             "align": st.session_state["db_align"], "release": st.session_state["db_release"],
+             "mem": st.session_state["db_mem"], "zone": st.session_state["db_zone"],
+             "fps_img": st.session_state["db_fps"]}
+        p["au"] = au_for(pa, pau, p["max_sec"], fps=float(p["fps_img"]) if pi else None)
+        if pi and not p["au"]["ok"]:
+            raise RuntimeError("Audio non leggibile / audio unreadable")
+        raw, final = os.path.join(tmp, "raw.mp4"), os.path.join(tmp, "out.mp4")
+        bar = st.progress(0.0)
+        fps, stt = databend_video(None if pi else pa, pi, raw, p, progress_cb=lambda v: bar.progress(min(1.0, v)))
+        finalize_h264(raw, pau or pa, final, keep_audio, p["max_sec"])
+        bar.empty()
+        publish(final, "DATABEND", p, fps, stt, preview)
+        return True
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Errore / Error :: {e}")
+        return False
+
+
+tab1, tab2, tab3 = st.tabs(["1 // BYTE (AVI)", "2 // OPTICAL FLOW", "3 // DATABENDING"])
 
 with tab1:
     st.write("Elimina I-frame, duplica P-frame e corrompe byte :: guidato dall'audio. "
@@ -770,6 +961,34 @@ with tab2:
     pv2 = r2.button("ANTEPRIMA / PREVIEW", disabled=up_a is None, key="pv2")
     if (go2 or pv2) and up_a is not None:
         finish(run_optical(pv2), pv2)
+
+with tab3:
+    st.write("I pixel diventano un segnale audio e passano negli effetti sonori. Funziona su un video (Video A) oppure su "
+             "un'immagine fissa che si anima col brano (Immagine + Audio esterno). Se carichi entrambi, usa l'immagine.")
+    labels = {"echo": "Eco / Echo", "reverb": "Riverbero / Reverb", "invert": "Inverti / Invert", "burn": "Amplifica / Burn",
+              "crush": "Bitcrush", "hp": "Passa-alto / Edge", "dist": "Distorsione / Distortion", "slip": "Slittamento byte / Slip"}
+    cols = st.columns(4)
+    for i, k in enumerate(FX):
+        cols[i % 4].slider(labels[k], 0.0, 1.0, step=0.05, key="db_" + k)
+    with st.expander("Driver audio per effetto / Audio driver per effect"):
+        dcols = st.columns(4)
+        for i, k in enumerate(FX):
+            dcols[i % 4].selectbox(labels[k], DRIVERS, key="db_d_" + k)
+    with st.expander("Avanzati / Advanced"):
+        a3, b3, c3 = st.columns(3)
+        a3.slider("Ritardo eco (frazione della larghezza)", 0.01, 1.5, step=0.01, key="db_delay")
+        a3.checkbox("Eco allineato ai pixel (multiplo di 3 byte)", key="db_align")
+        b3.slider("Decadimento effetti / Release", 0.0, 0.95, step=0.05, key="db_release")
+        b3.slider("Memoria (accumulo frame) / Feedback", 0.0, 0.95, step=0.05, key="db_mem")
+        c3.slider("Zona righe (%) / Row zone", 0, 100, key="db_zone")
+        c3.select_slider("FPS (solo immagine fissa)", OPTS["db_fps"], key="db_fps")
+    r1, r2 = st.columns(2)
+    nodata = up_a is None and up_img is None
+    go3 = r1.button("GENERA DATABEND / GENERATE", type="primary", disabled=nodata)
+    pv3 = r2.button("ANTEPRIMA / PREVIEW", disabled=nodata, key="pv3")
+    if go3 or pv3:
+        finish(run_databend(pv3), pv3)
+
 
 def dl_button(*args, **kw):
     try:  # senza rerun dell'app (Streamlit recente)
