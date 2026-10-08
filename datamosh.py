@@ -434,6 +434,65 @@ def byte_datamosh(src, src_b, out_avi, p):
     return fps, st
 
 
+PRESET_EN = {"Manuale": "Manual", "Glitch ritmico a tempo": "Rhythmic Glitch", "Caos totale": "Total Chaos",
+             "Minimale": "Minimal", "Liquido e morbido": "Liquid & Soft", "Codec rotto": "Broken Codec",
+             "Mosh a ondate": "Wave Mosh", "Un video mangia l'altro": "One Video Eats the Other",
+             "Cassa, rullante, hi-hat": "Kick, Snare, Hi-hat"}
+TRIG_EN = {"Onset": "Onset", "Beat (a tempo)": "Beat (tempo-locked)", "Onset + Beat": "Onset + Beat"}
+
+
+def build_report(kind, p, fps, stt, au_ok, preset, num):
+    """Report bilingue (IT + EN), hashtag e tag YouTube in inglese."""
+    byte = kind == "BYTE"
+    seed = p["seed"]
+    preset = "Manuale" if str(preset).startswith("—") else preset
+    eng = str(p.get("flow_engine", "")).split(" ")[0]
+
+    def block(lang):
+        it = lang == "it"
+
+        def yn(v):
+            return ("Sì" if it else "Yes") if v else "No"
+
+        note = (" (manuale)" if it else " (manual)") if p.get("bpm_manual", 0) > 0 else ""
+        rows = [("Approccio" if it else "Approach", kind),
+                ("Preset", preset if it else PRESET_EN.get(preset, preset)),
+                ("Seed", seed), ("FPS", f"{fps:.2f}"),
+                ("Finestra" if it else "Window", f"{p['mosh_start']}% -> {p['mosh_end']}%"),
+                ("Audio-reattivo" if it else "Audio-reactive", yn(au_ok)),
+                ("Trigger", p["trigger"] if it else TRIG_EN.get(p["trigger"], p["trigger"])),
+                ("Bande" if it else "Bands", yn(p["bands"])),
+                ("BPM", f"{p['au'].get('bpm', 0):.1f}{note}"),
+                ("Battuta" if it else "Meter", p["meter"]), ("Frames", stt["frames"])]
+        if byte:
+            rows += [("Dropped I", stt["dropped_i"]), ("Dups", stt["dups"]), ("Skips", stt["skips"]),
+                     ("Corrupt", stt["corrupt"]), ("Keyframe Audio", stt["kf_audio"]),
+                     ("Transfer", yn(stt["transfer"]))]
+            dsp = "AVI/MPEG-4 byte-level + librosa"
+        else:
+            rows += [("Modo" if it else "Mode", p["mode"]), ("Motore flow" if it else "Flow engine", eng),
+                     ("I-frame", stt["iframes"]), ("Hold", stt["holds"]), ("Bloom", stt["blooms"]),
+                     ("Transfer", yn(stt["transfer"]))]
+            dsp = f"OpenCV {eng} optical flow + librosa"
+        out = [f"DATAMOSH // N.{num:03d}"] + [f"{k} :: {v}" for k, v in rows]
+        return out + [f"DSP :: {dsp}", "Nessun Modello AI/neurale" if it else "No AI/Neural Models",
+                      "Direction & Algorithm :: Loop507"]
+
+    mid = ["byte"] if byte else ["opticalflow"]
+    end = ["mpeg4", "avi"] if byte else ["opencv", "motionvectors"]
+    hashtags = ["datamosh", "loop507"] + mid + ["glitchart", "noai", "generativeaudio", "sounddesign",
+        "aftereffects", "motiondesign", "algorithmicart", f"seed{seed}", "proceduralart", "digitalart",
+        "experimentalvideo", "experimentalsound", "librosa"] + end + ["datamoshing", "compressionart"]
+    yt = ["datamosh", "loop507", "byte" if byte else "optical flow", "glitch art", "no ai", "generative audio",
+          "sound design", "after effects", "motion design", "algorithmic art", f"seed {seed}", "procedural art",
+          "digital art", "experimental video", "experimental sound", "librosa"] + \
+         (["mpeg-4", "avi"] if byte else ["opencv", "motion vectors"]) + ["datamoshing", "compression art"]
+    sep = "=" * 40
+    return "\n".join([sep, "[ ITALIANO ]", sep, *block("it"), "", sep, "[ ENGLISH ]", sep, *block("en"), "",
+                      " ".join("#" + t for t in hashtags), "", sep, "[ TAG YOUTUBE — ENGLISH ONLY ]", sep,
+                      ", ".join(yt)]) + "\n"
+
+
 # ----------------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------------
@@ -443,7 +502,7 @@ st.caption("Minimalismo Computazionale / Glitch Brutalista :: audio-reactive :: 
 
 ACC = {"4/4": 4, "3/4": 3, "6/8": 6, "2/4": 2}
 DEFAULTS = {
-    "seed": 507, "mosh_range": (15, 100), "max_w": 640, "max_sec": 15, "prev_sec": 4,
+    "seed": 507, "mosh_range": (15, 100), "max_w": 640, "max_sec": 30, "prev_sec": 3,
     "keep_audio": True, "onset_thr": 0.6, "bloom_prob": 0.02, "trigger": "Onset",
     "bands": False, "bpm_manual": 0.0, "meter": "4/4", "flow_engine": "DIS (veloce)",
     "kf": 12, "qscale": 5, "kf_on_audio": True, "drop_mode": "Su onset", "drop_thr": 0.5,
@@ -456,7 +515,7 @@ KEEP = ("seed", "max_w", "max_sec", "prev_sec", "keep_audio", "bpm_manual", "met
 OPTS = {"trigger": ["Onset", "Beat (a tempo)", "Onset + Beat"], "drop_mode": ["Su onset", "Tutti", "Mai"],
         "mode": ["Block MV", "Optical Flow"], "block": [8, 16, 32, 64], "meter": list(ACC),
         "max_w": [320, 480, 640, 854, 1280], "flow_engine": ["DIS (veloce)", "Farneback"]}
-LIM = {"seed": (0, 2**31 - 1), "mosh_range": (0, 100), "max_sec": (2, 60), "prev_sec": (2, 8),
+LIM = {"seed": (0, 2**31 - 1), "mosh_range": (0, 100), "max_sec": (2, 180), "prev_sec": (2, 6),
        "onset_thr": (0.1, 1.0), "bloom_prob": (0.0, 0.3), "bpm_manual": (0.0, 300.0),
        "kf": (6, 120), "qscale": (2, 15), "drop_thr": (0.1, 1.0), "max_dup": (1, 40),
        "corrupt": (0.0, 0.01), "quiet_thr": (0.0, 0.6), "strength": (0.2, 4.0), "mv_noise": (0.0, 8.0),
@@ -483,8 +542,11 @@ PRESETS = {
 }
 for _k, _v in DEFAULTS.items():
     st.session_state.setdefault(_k, _v)
-for _k, _v in (("preset", MANUAL), ("dm_out", None), ("dm_report", None)):
+for _k, _v in (("preset", MANUAL), ("dm_out", None), ("dm_report", None), ("counter", 0), ("counter_pending", False)):
     st.session_state.setdefault(_k, _v)
+if st.session_state["counter_pending"]:  # dopo un render finale: prossimo numero progressivo
+    st.session_state["counter"] += 1
+    st.session_state["counter_pending"] = False
 
 
 def apply_preset():
@@ -553,10 +615,13 @@ with st.sidebar:
     seed = st.number_input("Seed", 0, 2**31 - 1, key="seed")
     st.button("Seed casuale / Random seed",
               on_click=lambda: st.session_state.update(seed=random.randint(0, 2**31 - 1)))
+    st.number_input("Numero progressivo N. / Counter (nome file e report)", 0, 9999, step=1, key="counter")
     mosh_range = st.slider("Finestra mosh / window (%)", 0, 100, key="mosh_range")
     max_w = st.select_slider("Larghezza max / Max width", OPTS["max_w"], key="max_w")
-    max_sec = st.slider("Durata max (s) / Max seconds", 2, 60, key="max_sec")
-    prev_sec = st.slider("Secondi anteprima / Preview seconds", 2, 8, key="prev_sec")
+    max_sec = st.slider("Durata max (s) / Max seconds", 2, 180, key="max_sec")
+    if max_sec > 60:
+        st.caption("Oltre 60 s il render puo' richiedere diversi minuti: prova prima con l'anteprima.")
+    prev_sec = st.slider("Secondi anteprima / Preview seconds", 2, 6, key="prev_sec")
     keep_audio = st.checkbox("Mantieni audio (A o esterno) / Keep audio", key="keep_audio")
     trigger = st.radio("Trigger audio", OPTS["trigger"], key="trigger",
                        help="Beat = scatti precisi sul tempo del brano (battere piu' forte).")
@@ -590,7 +655,7 @@ def save_uploads():
 
 def common(preview=False):
     return {"seed": int(seed), "mosh_start": mosh_range[0], "mosh_end": mosh_range[1],
-            "max_w": int(min(max_w, 320) if preview else max_w),
+            "max_w": int(min(max_w, 240) if preview else max_w),
             "max_sec": int(prev_sec if preview else max_sec),
             "onset_thr": onset_thr, "trigger": trigger, "bloom_prob": bloom_prob,
             "bands": bands, "bpm_manual": float(bpm_manual), "meter": meter}
@@ -604,10 +669,19 @@ def au_for(pa, pau, msec):
     return route_audio(au, trigger, bands)
 
 
-def publish(final, rep):
+def publish(final, kind, p, fps, stt, preview):
+    num = int(st.session_state["counter"])
+    name = f"DATAMOSH_N.{num:03d}" + ("_anteprima" if preview else "")
     with open(final, "rb") as f:
         st.session_state["dm_out"] = f.read()
-    st.session_state["dm_report"] = rep
+    txt = build_report(kind, p, fps, stt, p["au"]["ok"], st.session_state["preset"], num)
+    st.session_state["dm_report"] = {"name": name, "txt": txt, "preview": preview}
+
+
+def finish(ok, preview):
+    if ok and not preview:
+        st.session_state["counter_pending"] = True
+        st.rerun()
 
 
 def run_byte(preview):
@@ -621,9 +695,11 @@ def run_byte(preview):
         with st.spinner("Moshing bytes..."):
             fps, stt = byte_datamosh(pa, pb, avi, p)
             finalize_h264(avi, pau or pa, final, keep_audio, p["max_sec"])
-        publish(final, ("BYTE" + (" (anteprima)" if preview else ""), p, fps, stt, p["au"]["ok"]))
+        publish(final, "BYTE", p, fps, stt, preview)
+        return True
     except Exception as e:  # noqa: BLE001
         st.error(f"Errore / Error :: {e}")
+        return False
 
 
 def run_optical(preview):
@@ -641,9 +717,12 @@ def run_optical(preview):
         fps, stt = datamosh_video(pa, pb, raw, p, progress_cb=lambda v: bar.progress(min(1.0, v)))
         finalize_h264(raw, pau or pa, final, keep_audio, p["max_sec"])
         bar.empty()
-        publish(final, ("OPTICAL" + (" (anteprima)" if preview else ""), p, fps, stt, p["au"]["ok"]))
+        stt["transfer"] = pb is not None
+        publish(final, "OPTICAL", p, fps, stt, preview)
+        return True
     except Exception as e:  # noqa: BLE001
         st.error(f"Errore / Error :: {e}")
+        return False
 
 
 tab1, tab2 = st.tabs(["1 // BYTE (AVI)", "2 // OPTICAL FLOW"])
@@ -666,7 +745,7 @@ with tab1:
     go1 = r1.button("GENERA BYTE / GENERATE", type="primary", disabled=up_a is None)
     pv1 = r2.button("ANTEPRIMA / PREVIEW", disabled=up_a is None, key="pv1")
     if (go1 or pv1) and up_a is not None:
-        run_byte(pv1)
+        finish(run_byte(pv1), pv1)
 
 with tab2:
     st.write("Optical flow :: transfer A->B opzionale :: guidato dall'audio.")
@@ -690,22 +769,32 @@ with tab2:
     go2 = r1.button("GENERA OPTICAL / GENERATE", type="primary", disabled=up_a is None)
     pv2 = r2.button("ANTEPRIMA / PREVIEW", disabled=up_a is None, key="pv2")
     if (go2 or pv2) and up_a is not None:
-        run_optical(pv2)
+        finish(run_optical(pv2), pv2)
 
-if st.session_state["dm_out"] is not None:
-    st.video(st.session_state["dm_out"])
-    st.download_button("SCARICA MP4 / DOWNLOAD MP4", st.session_state["dm_out"],
-                       file_name="datamosh_loop507.mp4", mime="video/mp4")
-    kind, p, fps, stt, au_ok = st.session_state["dm_report"]
-    lines = ["DATAMOSH REPORT // LOOP507", f"approccio / approach :: {kind}",
-             f"preset :: {st.session_state['preset']}",
-             f"seed :: {p['seed']}  fps :: {fps:.2f}",
-             f"finestra / window :: {p['mosh_start']}% -> {p['mosh_end']}%",
-             f"audio-reactive :: {'si / yes' if au_ok else 'no (audio assente / missing)'}",
-             f"trigger :: {p.get('trigger', 'Onset')}  bande/bands :: {p.get('bands', False)}",
-             f"bpm :: {p['au'].get('bpm', 0):.1f}  battuta/meter :: {p.get('meter', '4/4')}"
-             + (" (BPM manuale)" if p.get("bpm_manual", 0) > 0 else "")]
-    lines += [f"{k} :: {v}" for k, v in stt.items()]
-    lines.append("dsp :: " + ("AVI/MPEG-4 byte-level" if kind.startswith("BYTE") else "OpenCV " + str(p.get("flow_engine")) + " + remap")
-                 + " + librosa :: no AI")
-    st.code("\n".join(lines), language="text")
+def dl_button(*args, **kw):
+    try:  # senza rerun dell'app (Streamlit recente)
+        return st.download_button(*args, on_click="ignore", **kw)
+    except TypeError:
+        return st.download_button(*args, **kw)
+
+
+def show_results():
+    r = st.session_state["dm_report"]
+    vcol, tcol = st.columns([1, 2] if r["preview"] else [3, 2])
+    vcol.video(st.session_state["dm_out"])
+    with tcol:
+        d1, d2 = st.columns(2)
+        with d1:
+            dl_button("SCARICA VIDEO / DOWNLOAD VIDEO", st.session_state["dm_out"],
+                      file_name=r["name"] + ".mp4", mime="video/mp4", key="dl_video")
+        with d2:
+            dl_button("SCARICA REPORT / DOWNLOAD REPORT", r["txt"],
+                      file_name=r["name"] + ".txt", mime="text/plain", key="dl_report")
+        st.caption(r["name"] + ".mp4  +  " + r["name"] + ".txt")
+        st.code(r["txt"], language="text")
+
+
+show_results = getattr(st, "fragment", lambda f: f)(show_results)
+
+if st.session_state["dm_out"] is not None and st.session_state["dm_report"] is not None:
+    show_results()
