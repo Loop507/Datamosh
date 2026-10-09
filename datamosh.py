@@ -72,6 +72,209 @@ def warp(img, flow, grid_x, grid_y):
                      borderMode=cv2.BORDER_REPLICATE)
 
 
+# ----------------------------------------------------------------------------
+# TRASFORMAZIONI DEL MOTO + MAPPE (tab 2 e 4)
+# ----------------------------------------------------------------------------
+MASKS = ["Ovunque", "Solo dove si muove", "Solo dove e' fermo", "Luminosita' alta", "Luminosita' bassa"]
+MT_DEFAULTS = {"gx": 0.0, "gy": 0.0, "zoom": 0.0, "zoom_drv": "Colpi/Beat", "rot": 0.0, "shear": 0.0,
+               "fluid": 0.0, "shift": 0.0, "mirror": "No", "mask": "Ovunque", "mthr": 1.0}
+MT_LIM = {"gx": (-8.0, 8.0), "gy": (-8.0, 8.0), "zoom": (-3.0, 3.0), "rot": (-3.0, 3.0), "shear": (-3.0, 3.0),
+          "fluid": (0.0, 1.0), "shift": (0.0, 1.0), "mthr": (0.2, 6.0)}
+
+
+def transform_flow(flow, mt, zenv_t, fs, rng, gx, gy, block):
+    """Gravita', zoom, rotazione, shear, specchio, blocchi sfasati e 'fluido' sul campo di moto."""
+    h, w = flow.shape[:2]
+    f = flow.copy()
+    if mt["fluid"] > 0:  # movimento medio: sfocatura spaziale + media nel tempo
+        k = 1 + 2 * int(25 * mt["fluid"])
+        if k > 1:
+            f = cv2.GaussianBlur(f, (k, k), 0)
+        a = 0.85 * mt["fluid"]
+        if fs.get("flow") is not None:
+            f = (1 - a) * f + a * fs["flow"]
+        fs["flow"] = f.copy()
+    cx, cy, sc = w / 2.0, h / 2.0, w / 2.0
+    if mt["zoom"]:
+        f -= mt["zoom"] * zenv_t * 6.0 * np.stack([gx - cx, gy - cy], -1) / sc
+    if mt["rot"]:
+        f += mt["rot"] * 6.0 * np.stack([-(gy - cy), gx - cx], -1) / sc
+    if mt["shear"]:
+        f[..., 0] += mt["shear"] * 6.0 * (gy - cy) / cy
+    f[..., 0] -= mt["gx"]
+    f[..., 1] -= mt["gy"]
+    if mt["mirror"] == "Orizzontale":
+        half = w // 2
+        f[:, w - half:] = f[:, :half][:, ::-1] * np.array([-1.0, 1.0], np.float32)
+    elif mt["mirror"] == "Verticale":
+        half = h // 2
+        f[h - half:] = f[:half][::-1] * np.array([1.0, -1.0], np.float32)
+    if mt["shift"] > 0:
+        nby, nbx = h // block, w // block
+        if nby > 0 and nbx > 0:
+            sel = rng.random((nby, nbx)) < mt["shift"]
+            vec = rng.integers(-12, 13, (nby, nbx, 2)).astype(np.float32)
+            field = np.where(sel[..., None], vec, 0.0).astype(np.float32)
+            f[:nby * block, :nbx * block] += cv2.resize(field, (nbx * block, nby * block),
+                                                        interpolation=cv2.INTER_NEAREST)
+    return f
+
+
+def motion_mask(mt, raw_flow, gray):
+    """Mappa 0-1 di dove agisce il mosh (None = ovunque)."""
+    kind = mt["mask"]
+    if kind == "Ovunque":
+        return None
+    if kind in ("Solo dove si muove", "Solo dove e' fermo"):
+        mag = cv2.GaussianBlur(np.linalg.norm(raw_flow, axis=2).astype(np.float32), (0, 0), 6)
+        m = np.clip((mag - mt["mthr"]) / max(0.2, mt["mthr"]), 0, 1)
+        return m if kind == "Solo dove si muove" else 1.0 - m
+    g = cv2.GaussianBlur(gray.astype(np.float32) / 255.0, (0, 0), 6)
+    m = np.clip((g - 0.5) * 6 + 0.5, 0, 1)
+    return m if kind == "Luminosita' alta" else 1.0 - m
+
+
+# ----------------------------------------------------------------------------
+# PIXEL SORTING (vettorizzato: nessun ciclo per riga)
+# ----------------------------------------------------------------------------
+PS_KEYS = ["Luminanza", "Tinta", "Saturazione", "Rosso", "Verde", "Blu"]
+PS_MODES = ["Soglia", "Bordi", "Casuale"]
+
+
+def ps_key(img, name):
+    if name == "Luminanza":
+        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    if name in ("Tinta", "Saturazione"):
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        return hsv[..., 0].astype(np.float32) / 179.0 if name == "Tinta" else hsv[..., 1].astype(np.float32) / 255.0
+    return img[..., {"Blu": 0, "Verde": 1, "Rosso": 2}[name]].astype(np.float32) / 255.0
+
+
+def sort_rows(img, key, sortable, maxlen, rng, reverse, skip, breaks=None):
+    """Ordina i pixel dentro ogni intervallo di una riga (intervallo = serie di pixel 'sortable')."""
+    h, w = key.shape
+    start = sortable.copy()
+    start[:, 1:] = sortable[:, 1:] & ~sortable[:, :-1]
+    if breaks is not None:
+        start |= breaks & sortable
+    run_id = np.cumsum(start.ravel()).reshape(h, w)
+    if skip > 0 and run_id.max() > 0:  # una parte degli intervalli resta com'e'
+        sortable = sortable & (rng.random(int(run_id.max()) + 1) >= skip)[run_id]
+    gid = run_id
+    if maxlen > 0:
+        idx = np.arange(w)[None, :]
+        rs = np.maximum.accumulate(np.where(start, idx, 0), axis=1)
+        gid = run_id * (w // maxlen + 2) + (idx - rs) // maxlen
+    sel = np.flatnonzero(sortable.ravel())
+    if sel.size == 0:
+        return img
+    k = key.ravel()[sel]
+    order = np.lexsort((-k if reverse else k, gid.ravel()[sel]))
+    flat = img.reshape(-1, 3)
+    out = flat.copy()
+    out[sel] = flat[sel[order]]
+    return out.reshape(img.shape)
+
+
+def pixelsort_frame(frame, p, env, rng):
+    ang = int(p["angle"]) % 180
+    h, w = frame.shape[:2]
+    valid = None
+    if ang == 0:
+        img = frame
+    elif ang == 90:
+        img = np.ascontiguousarray(frame.transpose(1, 0, 2))
+    else:
+        # tela quadrata abbastanza grande da non tagliare gli angoli quando si ruota
+        dd = int(np.ceil(np.hypot(w, h)))
+        py, px = (dd - h) // 2, (dd - w) // 2
+        canvas = cv2.copyMakeBorder(frame, py, dd - h - py, px, dd - w - px, cv2.BORDER_REPLICATE)
+        mtx = cv2.getRotationMatrix2D((dd / 2.0, dd / 2.0), ang, 1.0)
+        img = cv2.warpAffine(canvas, mtx, (dd, dd), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        inside = np.zeros((dd, dd), np.uint8)
+        inside[py:py + h, px:px + w] = 255
+        valid = cv2.warpAffine(inside, mtx, (dd, dd)) > 200  # si ordina solo l'immagine vera
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    lo, hi = p["range"]
+    ex = p["expand"] * env
+    ih, iw = gray.shape
+    breaks, skip, maxlen = None, p["skip"], int(p["maxlen"])
+    if p["imode"] == "Soglia":
+        g = gray.astype(np.float32) / 255.0
+        sortable = (g >= lo - ex) & (g <= hi + ex)
+    elif p["imode"] == "Bordi":
+        sc = 1.0 - 0.7 * min(1.0, ex / 0.6)  # con l'audio: piu' bordi, intervalli piu' corti
+        t1 = max(5, int(lo * 255 * sc))
+        edges = cv2.dilate(cv2.Canny(gray, t1, max(t1 + 10, int(hi * 255 * sc * 0.6))), np.ones((3, 3), np.uint8))
+        sortable = edges == 0
+    else:  # intervalli di lunghezza casuale
+        length = maxlen or 60
+        breaks = rng.random((ih, iw)) < 1.0 / length
+        sortable = np.ones((ih, iw), bool)
+        skip, maxlen = max(0.0, skip - ex), 0
+    if valid is not None:
+        sortable = sortable & valid
+    res = sort_rows(img, ps_key(img, p["key"]), sortable, maxlen, rng, p["reverse"], skip, breaks)
+    if ang == 0:
+        out = res
+    elif ang == 90:
+        out = np.ascontiguousarray(res.transpose(1, 0, 2))
+    else:
+        back = cv2.warpAffine(res, mtx, (dd, dd), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                              borderMode=cv2.BORDER_REPLICATE)
+        out = np.ascontiguousarray(back[py:py + h, px:px + w])
+    return out if p["mix"] >= 1 else cv2.addWeighted(frame, 1 - p["mix"], out, p["mix"], 0)
+
+
+def pixelsort_video(src_video, src_image, out_path, p, progress_cb=None):
+    """Video, oppure immagine fissa che si anima col brano (serve l'audio)."""
+    rng = np.random.default_rng(p["seed"])
+    au, cap = p["au"], None
+    if src_image:
+        img = cv2.imread(src_image)
+        if img is None:
+            raise RuntimeError("Immagine non leggibile / unreadable image")
+        fps = float(p["fps_img"])
+        oh, ow = img.shape[:2]
+        n = min(int(p["max_sec"] * fps), int(au["dur"] * fps))
+    else:
+        cap = cv2.VideoCapture(src_video)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        ow, oh = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        n = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1, int(p["max_sec"] * fps))
+    if n < 2:
+        raise RuntimeError("Audio o video troppo corto / source too short")
+    scale = min(1.0, p["max_w"] / float(ow))
+    w, h = max(16, int(ow * scale) // 2 * 2), max(16, int(oh * scale) // 2 * 2)
+    if src_image:
+        img = fit_frame(img, w, h)
+    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    env = driver_env(au, p["drv"], p["release"])
+    start_f, end_f = int(n * p["mosh_start"] / 100), int(n * p["mosh_end"] / 100)
+    done = sorted_n = 0
+    for t in range(n):
+        if src_image:
+            frame = img
+        else:
+            ok, fr = cap.read()
+            if not ok:
+                break
+            frame = fit_frame(fr, w, h)
+        if start_f <= t < end_f:
+            out = pixelsort_frame(frame, p, 1.0 if env is None else at(env, t), rng)
+            sorted_n += 1
+        else:
+            out = frame
+        writer.write(out)
+        done += 1
+        if progress_cb and t % 5 == 0:
+            progress_cb(t / max(1, n - 1))
+    writer.release()
+    if cap is not None:
+        cap.release()
+    return fps, {"frames": done, "sorted": sorted_n, "source": "image" if src_image else "video"}
+
+
 def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
     """
     src_a : video che fornisce il MOVIMENTO (e i frame reali fuori dalla finestra mosh)
@@ -84,6 +287,8 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
     au = p.get("au")
     dis = (cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
            if str(p["flow_engine"]).startswith("DIS") else None)
+    mt, fs = p.get("mt"), {}
+    zenv = driver_env(au, mt["zoom_drv"], 0.8) if (mt and au) else None
 
     cap = cv2.VideoCapture(src_a)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -146,7 +351,8 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
 
             # flow del frame
             k_str = p["strength"] * (1.0 + p["a_strength"] * at(au["rms"], t) if au else 1.0)
-            flow = compute_flow(prev_gray, gray, dis) * k_str
+            raw = compute_flow(prev_gray, gray, dis)
+            flow = raw * k_str
             if p["mode"] == "Block MV":
                 flow = to_block_mv(flow, p["block"], rng,
                                 p["mv_noise"] + (at(au["noise"], t) * 4.0 if au else 0.0))
@@ -165,6 +371,9 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
                 bloom_left = int(rng.integers(p["bloom_len"][0], p["bloom_len"][1] + 1))
                 stats["blooms"] += 1
 
+            if mt:
+                flow = transform_flow(flow, mt, 1.0 if zenv is None else at(zenv, t), fs, rng,
+                                      grid_x, grid_y, p["block"])
             mosh = warp(mosh, flow, grid_x, grid_y)
 
             # residuo: quanto del frame reale "trapela" nel mosh
@@ -172,6 +381,10 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
                 mosh = cv2.addWeighted(mosh, 1.0 - p["residual"],
                                        frame.astype(np.float32), p["residual"], 0)
 
+            if mt:
+                mk = motion_mask(mt, raw, gray)
+                if mk is not None:  # fuori dalla mappa torna il video reale
+                    mosh = mosh * mk[..., None] + frame.astype(np.float32) * (1.0 - mk[..., None])
             out = np.clip(mosh, 0, 255).astype(np.uint8)
 
         writer.write(out)
@@ -217,6 +430,8 @@ def residual_video(src_a, src_b, out_path, p, progress_cb=None):
     out_f = prev_f.copy()
     writer.write(first)
     gain = np.array([p["res_luma"], p["res_chroma"], p["res_chroma"]], np.float32)
+    mt, fs = p.get("mt"), {}
+    zenv = driver_env(au, mt["zoom_drv"], 0.8) if (mt and au) else None
     step = float(p["res_quant"])
     stt = {"frames": 1, "iframes": 0, "holds": 0, "blooms": 0}
     bloom_flow, bloom_left = None, 0
@@ -252,11 +467,20 @@ def residual_video(src_a, src_b, out_path, p, progress_cb=None):
                 bloom_flow = mflow * p["bloom_gain"]
                 bloom_left = int(rng.integers(p["bloom_len"][0], p["bloom_len"][1] + 1))
                 stt["blooms"] += 1
+            if mt:
+                mflow = transform_flow(mflow, mt, 1.0 if zenv is None else at(zenv, t), fs, rng,
+                                       gx, gy, p["block"])
             r = cur_f - warp(prev_f, true, gx, gy)  # il residuo che manderebbe l'encoder
             if step > 0:
                 r = np.round(r / step) * step
             gk = 1.0 + (p["a_strength"] * at(au["rms"], t) if au else 0.0)
             out_f = np.clip(warp(out_f, mflow, gx, gy) + (1.0 + (gain - 1.0) * min(gk, 3.0)) * r, 0, 255)
+            if p.get("decay", 0) > 0:  # l'errore svanisce piano piano verso il video reale
+                out_f = (1.0 - p["decay"]) * out_f + p["decay"] * cur_f
+            if mt:
+                mk = motion_mask(mt, raw, gray)
+                if mk is not None:
+                    out_f = out_f * mk[..., None] + cur_f * (1.0 - mk[..., None])
             out = cv2.cvtColor(out_f.astype(np.uint8), cv2.COLOR_YCrCb2BGR)
         writer.write(out)
         prev_gray, prev_f = gray, cur_f
@@ -689,10 +913,35 @@ PRESET_EN = {"Manuale": "Manual", "Glitch ritmico a tempo": "Rhythmic Glitch", "
              "Mosh a ondate": "Wave Mosh", "Un video mangia l'altro": "One Video Eats the Other",
              "Cassa, rullante, hi-hat": "Kick, Snare, Hi-hat", "Vernice fresca": "Fresh Paint",
              "Schermo bruciato": "Burnt Screen", "Fantasma a righe": "Striped Ghost",
-             "Confetti saturo": "Saturated Confetti", "Confetti fine": "Fine Confetti",
+             "Confetti saturo": "Saturated Confetti", "Zoom a pugno": "Slam Zoom", "Colata": "Melt Down",
+             "Vortice": "Vortex", "Specchio": "Mirror", "Confetti sui movimenti": "Motion Confetti",
+             "Confetti a decadimento": "Decaying Confetti", "Cascata": "Waterfall", "Fiamma": "Flame",
+             "Bordi sciolti": "Melted Edges", "Pioggia a tempo": "Beat Rain", "Diagonale a righe": "Striped Diagonal", "Confetti fine": "Fine Confetti",
              "Confetti a ondate": "Confetti Waves", "Residuo estremo": "Extreme Residual", "Pioggia digitale": "Digital Rain", "Blocchi corrotti": "Corrupted Blocks"}
 SCAN_EN = {"Orizzontale": "Horizontal", "Verticale": "Vertical", "Blocchi": "Blocks"}
 TRIG_EN = {"Onset": "Onset", "Beat (a tempo)": "Beat (tempo-locked)", "Onset + Beat": "Onset + Beat"}
+
+
+KEY_EN = {"Luminanza": "Luminance", "Tinta": "Hue", "Saturazione": "Saturation", "Rosso": "Red",
+          "Verde": "Green", "Blu": "Blue"}
+IMODE_EN = {"Soglia": "Threshold", "Bordi": "Edges", "Casuale": "Random"}
+MT_NAMES = {"zoom": ("zoom", "zoom"), "rot": ("rotazione", "rotation"), "shear": ("shear", "shear"),
+            "fluid": ("fluido", "fluid"), "shift": ("blocchi sfasati", "shifted blocks")}
+
+
+def mt_desc(mt, it):
+    """Elenco delle trasformazioni del moto attive (stringa vuota se nessuna)."""
+    if not mt:
+        return ""
+    i = 0 if it else 1
+    parts = [f"{MT_NAMES[k][i]} {mt[k]:+.1f}" for k in MT_NAMES if mt[k]]
+    if mt["gx"] or mt["gy"]:
+        parts.append(f"{'gravita' if it else 'gravity'} {mt['gx']:+.1f}/{mt['gy']:+.1f}")
+    if mt["mirror"] != "No":
+        parts.append(f"{'specchio' if it else 'mirror'} {mt['mirror']}")
+    if mt["mask"] != "Ovunque":
+        parts.append(f"{'mappa' if it else 'map'} {mt['mask']}")
+    return ", ".join(parts)
 
 
 def build_report(kind, p, fps, stt, au_ok, preset, num):
@@ -736,6 +985,18 @@ def build_report(kind, p, fps, stt, au_ok, preset, num):
                      ("I-frame", stt["iframes"]), ("Hold", stt["holds"]), ("Bloom", stt["blooms"]),
                      ("Transfer", yn(stt["transfer"]))]
             dsp = f"OpenCV {eng} flow + residual accumulation + librosa"
+        elif kind == "PIXELSORT":
+            src = "Video" if stt["source"] == "video" else ("Immagine" if it else "Still image")
+            lo, hi = p["range"]
+            rows += [("Sorgente" if it else "Source", src),
+                     ("Chiave" if it else "Key", p["key"] if it else KEY_EN[p["key"]]),
+                     ("Intervalli" if it else "Intervals", p["imode"] if it else IMODE_EN[p["imode"]]),
+                     ("Soglie" if it else "Range", f"{lo:.2f}-{hi:.2f}"),
+                     ("Angolo" if it else "Angle", f"{p['angle']} deg"),
+                     ("Lunghezza max" if it else "Max length", p["maxlen"] or "-"),
+                     ("Espansione audio" if it else "Audio expansion", f"{p['expand']:.2f} ({p['drv']})"),
+                     ("Frame ordinati" if it else "Sorted frames", stt["sorted"])]
+            dsp = "NumPy vectorized pixel sorting + librosa"
         else:
             nm = FX_IT if it else FX_EN
             fx = ", ".join(f"{nm[k]} {v:.2f}" for k, v in stt["fx"].items() if v > 0)
@@ -745,22 +1006,27 @@ def build_report(kind, p, fps, stt, au_ok, preset, num):
                      ("Spazio colore" if it else "Color space", stt["space"]),
                      ("Frame piegati" if it else "Bent frames", stt["bent"])]
             dsp = "NumPy/SciPy signal databending + librosa"
+        d = mt_desc(p.get("mt"), it) if kind in ("OPTICAL", "RESIDUAL") else ""
+        if d:
+            rows.append(("Moto" if it else "Motion", d))
+        if kind == "RESIDUAL" and p.get("decay", 0) > 0:
+            rows.append(("Decadimento" if it else "Decay", p["decay"]))
         out = [f"DATAMOSH // N.{num:03d}"] + [f"{k} :: {v}" for k, v in rows]
         return out + [f"DSP :: {dsp}", "Nessun Modello AI/neurale" if it else "No AI/Neural Models",
                       "Direction & Algorithm :: Loop507"]
 
     mid = {"BYTE": ["byte"], "OPTICAL": ["opticalflow"], "DATABEND": ["databending"],
-           "RESIDUAL": ["residualmosh"]}[kind]
+           "RESIDUAL": ["residualmosh"], "PIXELSORT": ["pixelsorting"]}[kind]
     end = {"BYTE": ["mpeg4", "avi"], "OPTICAL": ["opencv", "motionvectors"], "DATABEND": ["numpy", "scipy"],
-           "RESIDUAL": ["opencv", "pframe"]}[kind]
+           "RESIDUAL": ["opencv", "pframe"], "PIXELSORT": ["numpy", "opencv"]}[kind]
     hashtags = ["datamosh", "loop507"] + mid + ["glitchart", "noai", "generativeaudio", "sounddesign",
         "aftereffects", "motiondesign", "algorithmicart", f"seed{seed}", "proceduralart", "digitalart",
         "experimentalvideo", "experimentalsound", "librosa"] + end + ["datamoshing", "compressionart"]
-    yt = ["datamosh", "loop507", {"BYTE": "byte", "OPTICAL": "optical flow", "DATABEND": "databending", "RESIDUAL": "residual mosh"}[kind], "glitch art", "no ai", "generative audio",
+    yt = ["datamosh", "loop507", {"BYTE": "byte", "OPTICAL": "optical flow", "DATABEND": "databending", "RESIDUAL": "residual mosh", "PIXELSORT": "pixel sorting"}[kind], "glitch art", "no ai", "generative audio",
           "sound design", "after effects", "motion design", "algorithmic art", f"seed {seed}", "procedural art",
           "digital art", "experimental video", "experimental sound", "librosa"] + \
          {"BYTE": ["mpeg-4", "avi"], "OPTICAL": ["opencv", "motion vectors"], "DATABEND": ["numpy", "scipy"],
-         "RESIDUAL": ["opencv", "p-frame"]}[kind] + ["datamoshing", "compression art"]
+         "RESIDUAL": ["opencv", "p-frame"], "PIXELSORT": ["numpy", "opencv"]}[kind] + ["datamoshing", "compression art"]
     sep = "=" * 40
     return "\n".join([sep, "[ ITALIANO ]", sep, *block("it"), "", sep, "[ ENGLISH ]", sep, *block("en"), "",
                       " ".join("#" + t for t in hashtags), "", sep, "[ TAG YOUTUBE — ENGLISH ONLY ]", sep,
@@ -786,7 +1052,10 @@ DEFAULTS = {
     "a_bloom": True, "a_refresh": False, "refresh_thr": 0.85,
     "rs_luma": 1.25, "rs_chroma": 2.0, "rs_quant": 8.0, "rs_block": 16, "rs_strength": 1.0, "rs_mv_noise": 0.0,
     "rs_hold": 0.0, "rs_bloom": True, "rs_bloom_gain": 2.5, "rs_bloom_len": (6, 24), "rs_asr": 0.5,
-    "rs_refresh": False, "rs_refresh_thr": 0.85,
+    "rs_refresh": False, "rs_refresh_thr": 0.85, "rs_decay": 0.0,
+    "ps_key": "Luminanza", "ps_imode": "Soglia", "ps_range": (0.25, 0.85), "ps_angle": 0, "ps_maxlen": 0,
+    "ps_skip": 0.0, "ps_reverse": False, "ps_mix": 1.0, "ps_expand": 0.35, "ps_drv": "Colpi/Beat",
+    "ps_release": 0.8, "ps_fps": 30,
     "db_echo": 0.5, "db_reverb": 0.4, "db_invert": 0.3, "db_burn": 0.3, "db_crush": 0.2, "db_hp": 0.0,
     "db_dist": 0.0, "db_slip": 0.0,
     "db_d_echo": "Bassi", "db_d_reverb": "Volume", "db_d_invert": "Colpi/Beat", "db_d_burn": "Medi",
@@ -794,10 +1063,13 @@ DEFAULTS = {
     "db_scan": "Orizzontale", "db_space": "BGR", "db_tile": 32,
     "db_delay": 0.37, "db_align": False, "db_release": 0.8, "db_mem": 0.0, "db_zone": (0, 100), "db_fps": 30,
 }
+for _p in ("mt2", "mt4"):  # trasformazioni del moto: stesse impostazioni, una copia per tab
+    DEFAULTS.update({f"{_p}_{_k}": _v for _k, _v in MT_DEFAULTS.items()})
 KEEP = ("seed", "max_w", "max_sec", "prev_sec", "keep_audio", "bpm_manual", "meter", "flow_engine")
 OPTS = {"trigger": ["Onset", "Beat (a tempo)", "Onset + Beat"], "drop_mode": ["Su onset", "Tutti", "Mai"],
         "mode": ["Block MV", "Optical Flow"], "rs_block": [8, 16, 32, 64], "block": [8, 16, 32, 64], "meter": list(ACC),
-        "max_w": [320, 480, 640, 854, 1280], "flow_engine": ["DIS (veloce)", "Farneback"], "db_fps": [24, 25, 30], "db_scan": ["Orizzontale", "Verticale", "Blocchi"],
+        "max_w": [320, 480, 640, 854, 1280], "flow_engine": ["DIS (veloce)", "Farneback"], "ps_fps": [24, 25, 30], "ps_key": PS_KEYS, "ps_imode": PS_MODES, "ps_drv": DRIVERS,
+        "db_fps": [24, 25, 30], "db_scan": ["Orizzontale", "Verticale", "Blocchi"],
         "db_space": ["BGR", "YCrCb"], "db_tile": [16, 32, 64],
         **{"db_d_" + k: DRIVERS for k in FX}}
 LIM = {"seed": (0, 2**31 - 1), "mosh_range": (0, 100), "max_sec": (2, 180), "prev_sec": (2, 6),
@@ -808,7 +1080,12 @@ LIM = {"seed": (0, 2**31 - 1), "mosh_range": (0, 100), "max_sec": (2, 180), "pre
        "a_strength": (0.0, 3.0), "refresh_thr": (0.5, 1.0), "db_delay": (0.01, 1.5), "db_release": (0.0, 0.95),
        "db_mem": (0.0, 0.95), "db_zone": (0, 100), "rs_luma": (0.0, 3.0), "rs_chroma": (0.0, 4.0), "rs_quant": (0.0, 48.0), "rs_strength": (0.2, 4.0),
        "rs_mv_noise": (0.0, 8.0), "rs_hold": (0.0, 0.5), "rs_bloom_gain": (1.0, 5.0), "rs_bloom_len": (2, 60),
-       "rs_asr": (0.0, 3.0), "rs_refresh_thr": (0.5, 1.0), **{"db_" + k: (0.0, 1.0) for k in FX}}
+       "rs_asr": (0.0, 3.0), "rs_refresh_thr": (0.5, 1.0), "rs_decay": (0.0, 0.3),
+       "ps_range": (0.0, 1.0), "ps_angle": (0, 175), "ps_maxlen": (0, 400), "ps_skip": (0.0, 0.95),
+       "ps_mix": (0.0, 1.0), "ps_expand": (0.0, 0.6), "ps_release": (0.0, 0.95), **{"db_" + k: (0.0, 1.0) for k in FX}}
+for _p in ("mt2", "mt4"):
+    OPTS.update({f"{_p}_zoom_drv": DRIVERS, f"{_p}_mirror": ["No", "Orizzontale", "Verticale"], f"{_p}_mask": MASKS})
+    LIM.update({f"{_p}_{_k}": _v for _k, _v in MT_LIM.items()})
 MANUAL = "— manuale —"
 PRESETS = {
     "Glitch ritmico a tempo": ("Tab 1 Byte :: i colpi tolgono gli I-frame e spalmano il movimento, a tempo col brano.",
@@ -849,6 +1126,30 @@ PRESETS = {
          "rs_refresh_thr": 0.9, "rs_asr": 1.0}),
     "Residuo estremo": ("Tab 4 Residuo :: guadagni alti e grana grossa: immagine quasi distrutta, colori impazziti.",
         {"rs_luma": 1.5, "rs_chroma": 3.5, "rs_quant": 24.0, "rs_hold": 0.05, "rs_asr": 0.5}),
+    "Zoom a pugno": ("Tab 2 Optical :: lo zoom pulsa sui colpi: il mosh si gonfia verso di te a tempo col brano.",
+        {"mode": "Block MV", "block": 16, "strength": 1.0, "mt2_zoom": 1.2, "mt2_zoom_drv": "Colpi/Beat",
+         "mt2_fluid": 0.2, "a_bloom": True}),
+    "Colata": ("Tab 2 Optical :: l'immagine cola verso il basso come cera, con movimento liquido.",
+        {"mode": "Optical Flow", "strength": 1.0, "mt2_gy": 3.0, "mt2_fluid": 0.4, "residual": 0.04}),
+    "Vortice": ("Tab 2 Optical :: il movimento ruota e si avvita: mosh a spirale.",
+        {"mode": "Optical Flow", "mt2_rot": 1.0, "mt2_fluid": 0.5, "mt2_zoom": 0.3, "mt2_zoom_drv": "Fisso"}),
+    "Specchio": ("Tab 2 Optical :: il moto di sinistra viene specchiato a destra, con zoom a tempo.",
+        {"mode": "Block MV", "mt2_mirror": "Orizzontale", "mt2_zoom": 0.5, "mt2_zoom_drv": "Colpi/Beat"}),
+    "Confetti sui movimenti": ("Tab 4 Residuo :: coriandoli solo dove qualcosa si muove, il resto resta pulito.",
+        {"mt4_mask": "Solo dove si muove", "mt4_mthr": 1.0}),
+    "Confetti a decadimento": ("Tab 4 Residuo :: l'errore svanisce piano piano verso il video reale: ondate di colore.",
+        {"rs_decay": 0.06, "rs_luma": 1.3, "rs_chroma": 2.4}),
+    "Cascata": ("Tab 5 Pixel sort :: ordinamento verticale: cascate di colore dall'alto, la soglia si allarga sui bassi.",
+        {"ps_angle": 90, "ps_key": "Luminanza", "ps_range": (0.3, 0.9), "ps_expand": 0.4, "ps_drv": "Bassi"}),
+    "Fiamma": ("Tab 5 Pixel sort :: colonne ordinate per tinta e rovesciate: effetto fuoco, scatta sui colpi.",
+        {"ps_angle": 90, "ps_key": "Tinta", "ps_range": (0.2, 0.8), "ps_reverse": True, "ps_expand": 0.35}),
+    "Bordi sciolti": ("Tab 5 Pixel sort :: gli intervalli sono delimitati dai bordi: le forme si sciolgono in orizzontale.",
+        {"ps_imode": "Bordi", "ps_key": "Tinta", "ps_range": (0.2, 0.8), "ps_expand": 0.4}),
+    "Pioggia a tempo": ("Tab 5 Pixel sort :: gocce verticali corte e a tratti, sul tempo del brano.",
+        {"trigger": "Beat (a tempo)", "ps_angle": 90, "ps_maxlen": 80, "ps_skip": 0.3, "ps_expand": 0.5}),
+    "Diagonale a righe": ("Tab 5 Pixel sort :: ordinamento inclinato di 35 gradi per il canale rosso: righe diagonali.",
+        {"ps_angle": 35, "ps_key": "Rosso", "ps_range": (0.15, 0.8), "ps_maxlen": 160, "ps_expand": 0.3,
+         "ps_drv": "Volume"}),
     "Cassa, rullante, hi-hat": ("Tab 1 Byte :: modo bande: la cassa toglie gli I-frame, il rullante rinfresca, gli hi-hat corrompono.",
         {"bands": True, "drop_mode": "Su onset", "corrupt": 0.003, "max_dup": 14, "kf": 8}),
 }
@@ -861,7 +1162,7 @@ if st.session_state["counter_pending"]:  # dopo un render finale: prossimo numer
     st.session_state["counter_pending"] = False
 
 
-TAB_LABELS = ["1 // BYTE (AVI)", "2 // OPTICAL FLOW", "3 // DATABENDING", "4 // RESIDUO"]
+TAB_LABELS = ["1 // BYTE (AVI)", "2 // OPTICAL FLOW", "3 // DATABENDING", "4 // RESIDUO", "5 // PIXEL SORT"]
 
 
 def tab_of(name):
@@ -1036,7 +1337,8 @@ def run_optical(preview):
              "hold_prob": hold_prob, "bloom_gain": bloom_gain,
              "bloom_len": (int(bloom_len[0]), int(bloom_len[1])), "residual": residual,
              "a_strength": a_strength, "a_bloom": a_bloom, "a_refresh": a_refresh,
-             "refresh_thr": refresh_thr, "flow_engine": flow_engine}
+             "refresh_thr": refresh_thr, "flow_engine": flow_engine,
+             "mt": mt_from_state("mt2")}
         p["au"] = au_for(pa, pau, p["max_sec"])
         raw, final = os.path.join(tmp, "raw.mp4"), os.path.join(tmp, "out.mp4")
         bar = st.progress(0.0)
@@ -1045,6 +1347,52 @@ def run_optical(preview):
         bar.empty()
         stt["transfer"] = pb is not None
         publish(final, "OPTICAL", p, fps, stt, preview)
+        return True
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Errore / Error :: {e}")
+        return False
+
+
+def mt_from_state(pfx):
+    return {k: st.session_state[f"{pfx}_{k}"] for k in MT_DEFAULTS}
+
+
+def motion_controls(pfx):
+    st.caption("Trasformazioni del campo di moto e mappa: dove agisce il mosh.")
+    a, b, c = st.columns(3)
+    a.slider("Gravita' X (+ = destra)", -8.0, 8.0, step=0.5, key=f"{pfx}_gx")
+    a.slider("Gravita' Y (+ = verso il basso)", -8.0, 8.0, step=0.5, key=f"{pfx}_gy")
+    a.radio("Specchio / Mirror", ["No", "Orizzontale", "Verticale"], key=f"{pfx}_mirror", horizontal=True)
+    b.slider("Zoom (+ avanti / - indietro)", -3.0, 3.0, step=0.1, key=f"{pfx}_zoom")
+    b.selectbox("Lo zoom pulsa con", DRIVERS, key=f"{pfx}_zoom_drv")
+    b.slider("Rotazione / Vortice", -3.0, 3.0, step=0.1, key=f"{pfx}_rot")
+    c.slider("Shear", -3.0, 3.0, step=0.1, key=f"{pfx}_shear")
+    c.slider("Fluido (movimento medio)", 0.0, 1.0, step=0.05, key=f"{pfx}_fluid")
+    c.slider("Blocchi sfasati", 0.0, 1.0, step=0.05, key=f"{pfx}_shift")
+    d, e = st.columns(2)
+    d.selectbox("Dove agisce il mosh (mappa)", MASKS, key=f"{pfx}_mask")
+    e.slider("Soglia di movimento della mappa (px)", 0.2, 6.0, step=0.1, key=f"{pfx}_mthr")
+
+
+def run_pixelsort(preview):
+    tmp, pa, _, pau, pi = save_uploads()
+    try:
+        if pi and not pau:
+            raise RuntimeError("Per animare l'immagine serve un audio esterno / an audio file is required")
+        ss = st.session_state
+        p = {**common(preview), "key": ss["ps_key"], "imode": ss["ps_imode"], "range": tuple(ss["ps_range"]),
+             "angle": int(ss["ps_angle"]), "maxlen": int(ss["ps_maxlen"]), "skip": ss["ps_skip"],
+             "reverse": ss["ps_reverse"], "mix": ss["ps_mix"], "expand": ss["ps_expand"], "drv": ss["ps_drv"],
+             "release": ss["ps_release"], "fps_img": ss["ps_fps"]}
+        p["au"] = au_for(pa, pau, p["max_sec"], fps=float(p["fps_img"]) if pi else None)
+        if pi and not p["au"]["ok"]:
+            raise RuntimeError("Audio non leggibile / audio unreadable")
+        raw, final = os.path.join(tmp, "raw.mp4"), os.path.join(tmp, "out.mp4")
+        bar = st.progress(0.0)
+        fps, stt = pixelsort_video(None if pi else pa, pi, raw, p, progress_cb=lambda v: bar.progress(min(1.0, v)))
+        finalize_h264(raw, pau or pa, final, keep_audio, p["max_sec"])
+        bar.empty()
+        publish(final, "PIXELSORT", p, fps, stt, preview)
         return True
     except Exception as e:  # noqa: BLE001
         st.error(f"Errore / Error :: {e}")
@@ -1086,7 +1434,7 @@ def run_residual(preview):
              "mv_noise": ss["rs_mv_noise"], "hold_prob": ss["rs_hold"], "a_bloom": ss["rs_bloom"],
              "bloom_gain": ss["rs_bloom_gain"], "bloom_len": (int(ss["rs_bloom_len"][0]), int(ss["rs_bloom_len"][1])),
              "a_strength": ss["rs_asr"], "a_refresh": ss["rs_refresh"], "refresh_thr": ss["rs_refresh_thr"],
-             "flow_engine": ss["flow_engine"]}
+             "flow_engine": ss["flow_engine"], "decay": ss["rs_decay"], "mt": mt_from_state("mt4")}
         p["au"] = au_for(pa, pau, p["max_sec"])
         raw, final = os.path.join(tmp, "raw.mp4"), os.path.join(tmp, "out.mp4")
         bar = st.progress(0.0)
@@ -1102,9 +1450,9 @@ def run_residual(preview):
 
 
 try:  # Streamlit recente: i tab ricordano la selezione e si possono cambiare da codice
-    tab1, tab2, tab3, tab4 = st.tabs(TAB_LABELS, key="active_tab", on_change="rerun")
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(TAB_LABELS, key="active_tab", on_change="rerun")
 except TypeError:  # versione vecchia: nessun cambio automatico di tab
-    tab1, tab2, tab3, tab4 = st.tabs(TAB_LABELS)
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(TAB_LABELS)
 
 with tab1:
     st.write("Elimina I-frame, duplica P-frame e corrompe byte :: guidato dall'audio. "
@@ -1144,6 +1492,8 @@ with tab2:
         flow_engine = b2.radio("Motore flow / Flow engine", OPTS["flow_engine"], key="flow_engine")
         bloom_gain = c2.slider("Bloom gain", 1.0, 5.0, step=0.1, key="bloom_gain")
         bloom_len = c2.slider("Bloom durata / length", 2, 60, key="bloom_len")
+    with st.expander("Trasformazioni del moto / Motion transforms"):
+        motion_controls("mt2")
     r1, r2 = st.columns(2)
     go2 = r1.button("GENERA OPTICAL / GENERATE", type="primary", disabled=up_a is None)
     pv2 = r2.button("ANTEPRIMA / PREVIEW", disabled=up_a is None, key="pv2")
@@ -1203,11 +1553,42 @@ with tab4:
         c4.slider("Hold prob", 0.0, 0.5, step=0.01, key="rs_hold")
         c4.slider("Bloom gain", 1.0, 5.0, step=0.1, key="rs_bloom_gain")
         c4.slider("Bloom durata / length", 2, 60, key="rs_bloom_len")
+        c4.slider("Decadimento dell'errore / Decay", 0.0, 0.3, step=0.01, key="rs_decay")
+    with st.expander("Trasformazioni del moto / Motion transforms"):
+        motion_controls("mt4")
     r1, r2 = st.columns(2)
     go4 = r1.button("GENERA RESIDUO / GENERATE", type="primary", disabled=up_a is None)
     pv4 = r2.button("ANTEPRIMA / PREVIEW", disabled=up_a is None, key="pv4")
     if (go4 or pv4) and up_a is not None:
         finish(run_residual(pv4), pv4)
+
+
+with tab5:
+    st.write("Ordina i pixel di righe o colonne dentro intervalli scelti da una soglia: colate, cascate e righe. "
+             "La soglia si allarga sui colpi. Funziona su un video (Video A) oppure su un'immagine fissa che si anima col brano "
+             "(Immagine + Audio esterno).")
+    a5, b5, c5 = st.columns(3)
+    a5.selectbox("Ordina per / Sort key", PS_KEYS, key="ps_key")
+    b5.radio("Intervalli / Intervals", PS_MODES, key="ps_imode", horizontal=True,
+             help="Soglia = in base alla luminosita'; Bordi = tra un bordo e l'altro; Casuale = tratti di lunghezza casuale.")
+    c5.slider("Angolo / Angle (0 = righe, 90 = colonne)", 0, 175, step=5, key="ps_angle")
+    a5.slider("Soglie luminosita' (min - max)", 0.0, 1.0, step=0.05, key="ps_range")
+    b5.slider("Espansione sui colpi / Audio expansion", 0.0, 0.6, step=0.05, key="ps_expand")
+    c5.selectbox("L'espansione segue", DRIVERS, key="ps_drv")
+    with st.expander("Avanzati / Advanced"):
+        a6, b6, c6 = st.columns(3)
+        a6.slider("Lunghezza max intervallo (px, 0 = libera)", 0, 400, step=10, key="ps_maxlen")
+        a6.slider("Intervalli lasciati intatti / Skip", 0.0, 0.95, step=0.05, key="ps_skip")
+        b6.checkbox("Ordine inverso / Reverse", key="ps_reverse")
+        b6.slider("Mix con l'originale", 0.0, 1.0, step=0.05, key="ps_mix")
+        c6.slider("Decadimento / Release", 0.0, 0.95, step=0.05, key="ps_release")
+        c6.select_slider("FPS (solo immagine fissa)", OPTS["ps_fps"], key="ps_fps")
+    r1, r2 = st.columns(2)
+    nodata5 = up_a is None and up_img is None
+    go5 = r1.button("GENERA PIXEL SORT / GENERATE", type="primary", disabled=nodata5)
+    pv5 = r2.button("ANTEPRIMA / PREVIEW", disabled=nodata5, key="pv5")
+    if go5 or pv5:
+        finish(run_pixelsort(pv5), pv5)
 
 
 def dl_button(*args, **kw):
