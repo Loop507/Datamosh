@@ -186,6 +186,89 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
     return fps, stats
 
 
+def residual_video(src_a, src_b, out_path, p, progress_cb=None):
+    """Simula un decoder P-frame: out = warp(out_prev, moto) + guadagno * residuo (accumulo + clipping).
+    Con guadagno > 1 e quantizzazione l'errore si accumula: colori saturi e coriandoli sui bordi."""
+    rng = np.random.default_rng(p["seed"])
+    au = p.get("au")
+    dis = (cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+           if str(p["flow_engine"]).startswith("DIS") else None)
+    cap = cv2.VideoCapture(src_a)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    ow, oh = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    scale = min(1.0, p["max_w"] / float(ow))
+    w, h = max(16, int(ow * scale) // 2 * 2), max(16, int(oh * scale) // 2 * 2)
+    n_max = min(total, int(p["max_sec"] * fps))
+    cap_b = cv2.VideoCapture(src_b) if src_b else None
+    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    start_f, end_f = int(n_max * p["mosh_start"] / 100), int(n_max * p["mosh_end"] / 100)
+
+    def ycc(img):
+        return cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb).astype(np.float32)
+
+    ok, first = cap.read()
+    if not ok:
+        raise RuntimeError("Impossibile leggere il video / cannot read video")
+    first = fit_frame(first, w, h)
+    prev_gray, prev_f = cv2.cvtColor(first, cv2.COLOR_BGR2GRAY), ycc(first)
+    out_f = prev_f.copy()
+    writer.write(first)
+    gain = np.array([p["res_luma"], p["res_chroma"], p["res_chroma"]], np.float32)
+    step = float(p["res_quant"])
+    stt = {"frames": 1, "iframes": 0, "holds": 0, "blooms": 0}
+    bloom_flow, bloom_left = None, 0
+    for t in range(1, n_max):
+        ok, fr = cap.read()
+        if not ok:
+            break
+        frame = fit_frame(fr, w, h)
+        gray, cur_f = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), ycc(frame)
+        if not (start_f <= t < end_f):
+            out_f, out = cur_f.copy(), frame
+        else:
+            if t == start_f and cap_b is not None:
+                okb, fb = cap_b.read()
+                if okb:
+                    out_f = ycc(fit_frame(fb, w, h))
+            if au and p["a_refresh"] and at(au["trig_refresh"], t) > p["refresh_thr"]:
+                out_f = cur_f.copy()  # "I-frame": azzera l'accumulo
+                bloom_left = 0
+                stt["iframes"] += 1
+            k_str = p["strength"] * (1.0 + p["a_strength"] * at(au["rms"], t) if au else 1.0)
+            raw = compute_flow(prev_gray, gray, dis)
+            true = to_block_mv(raw, p["block"], rng, 0.0)  # moto "vero" a macroblocchi
+            mflow = to_block_mv(raw * k_str, p["block"], rng,
+                                p["mv_noise"] + (at(au["noise"], t) * 4.0 if au else 0.0))
+            if rng.random() < p["hold_prob"]:
+                mflow = np.zeros_like(mflow)
+                stt["holds"] += 1
+            if bloom_left > 0 and bloom_flow is not None:
+                mflow, bloom_left = bloom_flow, bloom_left - 1
+            elif (au and p["a_bloom"] and at(au["trig_bloom"], t) > p["onset_thr"]) or \
+                    rng.random() < p["bloom_prob"]:
+                bloom_flow = mflow * p["bloom_gain"]
+                bloom_left = int(rng.integers(p["bloom_len"][0], p["bloom_len"][1] + 1))
+                stt["blooms"] += 1
+            r = cur_f - warp(prev_f, true, gx, gy)  # il residuo che manderebbe l'encoder
+            if step > 0:
+                r = np.round(r / step) * step
+            gk = 1.0 + (p["a_strength"] * at(au["rms"], t) if au else 0.0)
+            out_f = np.clip(warp(out_f, mflow, gx, gy) + (1.0 + (gain - 1.0) * min(gk, 3.0)) * r, 0, 255)
+            out = cv2.cvtColor(out_f.astype(np.uint8), cv2.COLOR_YCrCb2BGR)
+        writer.write(out)
+        prev_gray, prev_f = gray, cur_f
+        stt["frames"] += 1
+        if progress_cb and t % 5 == 0:
+            progress_cb(t / max(1, n_max - 1))
+    writer.release()
+    cap.release()
+    if cap_b is not None:
+        cap_b.release()
+    return fps, stt
+
+
 def finalize_h264(raw_path, audio_src, final_path, keep_audio, max_sec):
     """Re-encode in H.264 (compatibile browser) + audio opzionale dalla sorgente."""
     cmd = [FFMPEG, "-y", "-err_detect", "ignore_err", "-i", raw_path]
@@ -520,6 +603,33 @@ def bend_frame(frame, amt, p, rng):
     return out
 
 
+def to_tiles(f, t):
+    """Riordina l'immagine a tessere t x t: il segnale attraversa una tessera dopo l'altra."""
+    h2, w2 = f.shape[0] // t * t, f.shape[1] // t * t
+    g = f[:h2, :w2].reshape(h2 // t, t, w2 // t, t, 3).transpose(0, 2, 1, 3, 4)
+    return np.ascontiguousarray(g).reshape(h2, w2, 3)
+
+
+def from_tiles(g, t, out):
+    h2, w2 = g.shape[:2]
+    out[:h2, :w2] = g.reshape(h2 // t, w2 // t, t, t, 3).transpose(0, 2, 1, 3, 4).reshape(h2, w2, 3)
+    return out
+
+
+def bend_scan(frame, amt, p, rng):
+    """Direzione di lettura (orizzontale/verticale/blocchi) e spazio colore: cambiano il disegno dell'effetto."""
+    f = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb) if p["space"] == "YCrCb" else frame
+    if p["scan"] == "Verticale":
+        g = bend_frame(np.ascontiguousarray(f.transpose(1, 0, 2)), amt, p, rng)
+        f = np.ascontiguousarray(g.transpose(1, 0, 2))
+    elif p["scan"] == "Blocchi" and min(f.shape[:2]) >= 2 * int(p["tile"]):
+        t = int(p["tile"])
+        f = from_tiles(bend_frame(to_tiles(f, t), amt, p, rng), t, f.copy())
+    else:
+        f = bend_frame(f, amt, p, rng)
+    return cv2.cvtColor(f, cv2.COLOR_YCrCb2BGR) if p["space"] == "YCrCb" else f
+
+
 def databend_video(src_video, src_image, out_path, p, progress_cb=None):
     """Sorgente: un video oppure un'immagine fissa che si anima col brano (serve l'audio)."""
     rng = np.random.default_rng(p["seed"])
@@ -558,7 +668,7 @@ def databend_video(src_video, src_image, out_path, p, progress_cb=None):
             amt = {k: min(1.0, p["db_fx"][k] * (1.0 if env[k] is None else at(env[k], t))) for k in FX}
             base = frame if prev is None or p["mem"] <= 0 else \
                 cv2.addWeighted(frame, 1 - p["mem"], prev, p["mem"], 0)
-            out = bend_frame(base, amt, p, rng)
+            out = bend_scan(base, amt, p, rng)
             prev, bent = out, bent + 1
         else:
             out, prev = frame, None
@@ -570,14 +680,17 @@ def databend_video(src_video, src_image, out_path, p, progress_cb=None):
     if cap is not None:
         cap.release()
     return fps, {"frames": done, "bent": bent, "source": "image" if src_image else "video",
-                 "fx": dict(p["db_fx"])}
+                 "fx": dict(p["db_fx"]), "scan": p["scan"], "space": p["space"]}
 
 
 PRESET_EN = {"Manuale": "Manual", "Glitch ritmico a tempo": "Rhythmic Glitch", "Caos totale": "Total Chaos",
              "Minimale": "Minimal", "Liquido e morbido": "Liquid & Soft", "Codec rotto": "Broken Codec",
              "Mosh a ondate": "Wave Mosh", "Un video mangia l'altro": "One Video Eats the Other",
              "Cassa, rullante, hi-hat": "Kick, Snare, Hi-hat", "Vernice fresca": "Fresh Paint",
-             "Schermo bruciato": "Burnt Screen", "Fantasma a righe": "Striped Ghost"}
+             "Schermo bruciato": "Burnt Screen", "Fantasma a righe": "Striped Ghost",
+             "Confetti saturo": "Saturated Confetti", "Confetti fine": "Fine Confetti",
+             "Confetti a ondate": "Confetti Waves", "Residuo estremo": "Extreme Residual", "Pioggia digitale": "Digital Rain", "Blocchi corrotti": "Corrupted Blocks"}
+SCAN_EN = {"Orizzontale": "Horizontal", "Verticale": "Vertical", "Blocchi": "Blocks"}
 TRIG_EN = {"Onset": "Onset", "Beat (a tempo)": "Beat (tempo-locked)", "Onset + Beat": "Onset + Beat"}
 
 
@@ -614,26 +727,39 @@ def build_report(kind, p, fps, stt, au_ok, preset, num):
                      ("I-frame", stt["iframes"]), ("Hold", stt["holds"]), ("Bloom", stt["blooms"]),
                      ("Transfer", yn(stt["transfer"]))]
             dsp = f"OpenCV {eng} optical flow + librosa"
+        elif kind == "RESIDUAL":
+            rows += [("Blocco" if it else "Block", p["block"]), ("Motore flow" if it else "Flow engine", eng),
+                     ("Guadagno luma" if it else "Luma gain", p["res_luma"]),
+                     ("Guadagno colore" if it else "Chroma gain", p["res_chroma"]),
+                     ("Quantizzazione" if it else "Quantization", p["res_quant"]),
+                     ("I-frame", stt["iframes"]), ("Hold", stt["holds"]), ("Bloom", stt["blooms"]),
+                     ("Transfer", yn(stt["transfer"]))]
+            dsp = f"OpenCV {eng} flow + residual accumulation + librosa"
         else:
             nm = FX_IT if it else FX_EN
             fx = ", ".join(f"{nm[k]} {v:.2f}" for k, v in stt["fx"].items() if v > 0)
             src = "Video" if stt["source"] == "video" else ("Immagine" if it else "Still image")
             rows += [("Sorgente" if it else "Source", src), ("Effetti" if it else "Effects", fx or "-"),
+                     ("Scansione" if it else "Scan", stt["scan"] if it else SCAN_EN[stt["scan"]]),
+                     ("Spazio colore" if it else "Color space", stt["space"]),
                      ("Frame piegati" if it else "Bent frames", stt["bent"])]
             dsp = "NumPy/SciPy signal databending + librosa"
         out = [f"DATAMOSH // N.{num:03d}"] + [f"{k} :: {v}" for k, v in rows]
         return out + [f"DSP :: {dsp}", "Nessun Modello AI/neurale" if it else "No AI/Neural Models",
                       "Direction & Algorithm :: Loop507"]
 
-    mid = {"BYTE": ["byte"], "OPTICAL": ["opticalflow"], "DATABEND": ["databending"]}[kind]
-    end = {"BYTE": ["mpeg4", "avi"], "OPTICAL": ["opencv", "motionvectors"], "DATABEND": ["numpy", "scipy"]}[kind]
+    mid = {"BYTE": ["byte"], "OPTICAL": ["opticalflow"], "DATABEND": ["databending"],
+           "RESIDUAL": ["residualmosh"]}[kind]
+    end = {"BYTE": ["mpeg4", "avi"], "OPTICAL": ["opencv", "motionvectors"], "DATABEND": ["numpy", "scipy"],
+           "RESIDUAL": ["opencv", "pframe"]}[kind]
     hashtags = ["datamosh", "loop507"] + mid + ["glitchart", "noai", "generativeaudio", "sounddesign",
         "aftereffects", "motiondesign", "algorithmicart", f"seed{seed}", "proceduralart", "digitalart",
         "experimentalvideo", "experimentalsound", "librosa"] + end + ["datamoshing", "compressionart"]
-    yt = ["datamosh", "loop507", {"BYTE": "byte", "OPTICAL": "optical flow", "DATABEND": "databending"}[kind], "glitch art", "no ai", "generative audio",
+    yt = ["datamosh", "loop507", {"BYTE": "byte", "OPTICAL": "optical flow", "DATABEND": "databending", "RESIDUAL": "residual mosh"}[kind], "glitch art", "no ai", "generative audio",
           "sound design", "after effects", "motion design", "algorithmic art", f"seed {seed}", "procedural art",
           "digital art", "experimental video", "experimental sound", "librosa"] + \
-         {"BYTE": ["mpeg-4", "avi"], "OPTICAL": ["opencv", "motion vectors"], "DATABEND": ["numpy", "scipy"]}[kind] + ["datamoshing", "compression art"]
+         {"BYTE": ["mpeg-4", "avi"], "OPTICAL": ["opencv", "motion vectors"], "DATABEND": ["numpy", "scipy"],
+         "RESIDUAL": ["opencv", "p-frame"]}[kind] + ["datamoshing", "compression art"]
     sep = "=" * 40
     return "\n".join([sep, "[ ITALIANO ]", sep, *block("it"), "", sep, "[ ENGLISH ]", sep, *block("en"), "",
                       " ".join("#" + t for t in hashtags), "", sep, "[ TAG YOUTUBE — ENGLISH ONLY ]", sep,
@@ -657,16 +783,21 @@ DEFAULTS = {
     "mode": "Block MV", "block": 16, "strength": 1.5, "mv_noise": 0.0, "hold_prob": 0.05,
     "bloom_gain": 2.5, "bloom_len": (6, 24), "residual": 0.0, "a_strength": 1.0,
     "a_bloom": True, "a_refresh": False, "refresh_thr": 0.85,
+    "rs_luma": 1.25, "rs_chroma": 2.0, "rs_quant": 8.0, "rs_block": 16, "rs_strength": 1.0, "rs_mv_noise": 0.0,
+    "rs_hold": 0.0, "rs_bloom": True, "rs_bloom_gain": 2.5, "rs_bloom_len": (6, 24), "rs_asr": 0.5,
+    "rs_refresh": False, "rs_refresh_thr": 0.85,
     "db_echo": 0.5, "db_reverb": 0.4, "db_invert": 0.3, "db_burn": 0.3, "db_crush": 0.2, "db_hp": 0.0,
     "db_dist": 0.0, "db_slip": 0.0,
     "db_d_echo": "Bassi", "db_d_reverb": "Volume", "db_d_invert": "Colpi/Beat", "db_d_burn": "Medi",
     "db_d_crush": "Acuti", "db_d_hp": "Acuti", "db_d_dist": "Volume", "db_d_slip": "Colpi/Beat",
+    "db_scan": "Orizzontale", "db_space": "BGR", "db_tile": 32,
     "db_delay": 0.37, "db_align": False, "db_release": 0.8, "db_mem": 0.0, "db_zone": (0, 100), "db_fps": 30,
 }
 KEEP = ("seed", "max_w", "max_sec", "prev_sec", "keep_audio", "bpm_manual", "meter", "flow_engine")
 OPTS = {"trigger": ["Onset", "Beat (a tempo)", "Onset + Beat"], "drop_mode": ["Su onset", "Tutti", "Mai"],
-        "mode": ["Block MV", "Optical Flow"], "block": [8, 16, 32, 64], "meter": list(ACC),
-        "max_w": [320, 480, 640, 854, 1280], "flow_engine": ["DIS (veloce)", "Farneback"], "db_fps": [24, 25, 30],
+        "mode": ["Block MV", "Optical Flow"], "rs_block": [8, 16, 32, 64], "block": [8, 16, 32, 64], "meter": list(ACC),
+        "max_w": [320, 480, 640, 854, 1280], "flow_engine": ["DIS (veloce)", "Farneback"], "db_fps": [24, 25, 30], "db_scan": ["Orizzontale", "Verticale", "Blocchi"],
+        "db_space": ["BGR", "YCrCb"], "db_tile": [16, 32, 64],
         **{"db_d_" + k: DRIVERS for k in FX}}
 LIM = {"seed": (0, 2**31 - 1), "mosh_range": (0, 100), "max_sec": (2, 180), "prev_sec": (2, 6),
        "onset_thr": (0.1, 1.0), "bloom_prob": (0.0, 0.3), "bpm_manual": (0.0, 300.0),
@@ -674,7 +805,9 @@ LIM = {"seed": (0, 2**31 - 1), "mosh_range": (0, 100), "max_sec": (2, 180), "pre
        "corrupt": (0.0, 0.01), "quiet_thr": (0.0, 0.6), "strength": (0.2, 4.0), "mv_noise": (0.0, 8.0),
        "hold_prob": (0.0, 0.5), "bloom_gain": (1.0, 5.0), "bloom_len": (2, 60), "residual": (0.0, 0.5),
        "a_strength": (0.0, 3.0), "refresh_thr": (0.5, 1.0), "db_delay": (0.01, 1.5), "db_release": (0.0, 0.95),
-       "db_mem": (0.0, 0.95), "db_zone": (0, 100), **{"db_" + k: (0.0, 1.0) for k in FX}}
+       "db_mem": (0.0, 0.95), "db_zone": (0, 100), "rs_luma": (0.0, 3.0), "rs_chroma": (0.0, 4.0), "rs_quant": (0.0, 48.0), "rs_strength": (0.2, 4.0),
+       "rs_mv_noise": (0.0, 8.0), "rs_hold": (0.0, 0.5), "rs_bloom_gain": (1.0, 5.0), "rs_bloom_len": (2, 60),
+       "rs_asr": (0.0, 3.0), "rs_refresh_thr": (0.5, 1.0), **{"db_" + k: (0.0, 1.0) for k in FX}}
 MANUAL = "— manuale —"
 PRESETS = {
     "Glitch ritmico a tempo": ("Tab 1 Byte :: i colpi tolgono gli I-frame e spalmano il movimento, a tempo col brano.",
@@ -689,7 +822,7 @@ PRESETS = {
         {"mode": "Block MV", "block": 32, "strength": 2.0, "mv_noise": 2.0, "a_bloom": True}),
     "Mosh a ondate": ("Tab 2 Optical :: il movimento si accumula, sui colpi forti l'immagine si rinfresca. A ondate col brano.",
         {"trigger": "Beat (a tempo)", "a_refresh": True, "refresh_thr": 0.9, "bloom_len": (8, 30)}),
-    "Un video mangia l'altro": ("Tab 1 o 2 :: carica Video A (movimento) e Video B (immagine): A deforma B.",
+    "Un video mangia l'altro": ("Tab 1, 2 o 4 :: carica Video A (movimento) e Video B (immagine): A deforma B.",
         {"mode": "Block MV", "block": 16, "mosh_range": (0, 100), "residual": 0.0}),
     "Vernice fresca": ("Tab 3 Databending :: pixel trascinati come vernice fresca, a ritmo di volume.",
         {"db_reverb": 0.9, "db_echo": 0.2, "db_invert": 0.0, "db_burn": 0.0, "db_crush": 0.0,
@@ -700,6 +833,21 @@ PRESETS = {
     "Fantasma a righe": ("Tab 3 Databending :: sdoppiamenti diagonali e bordi: ghosting a righe.",
         {"db_echo": 0.9, "db_hp": 0.6, "db_delay": 0.33, "db_reverb": 0.0, "db_invert": 0.0, "db_burn": 0.0,
          "db_crush": 0.0, "db_d_echo": "Volume"}),
+    "Pioggia digitale": ("Tab 3 Databending :: lettura verticale: colature e gocce che cadono dall'alto.",
+        {"db_scan": "Verticale", "db_reverb": 0.8, "db_echo": 0.4, "db_invert": 0.0, "db_burn": 0.0,
+         "db_crush": 0.0, "db_d_reverb": "Volume", "db_mem": 0.3}),
+    "Blocchi corrotti": ("Tab 3 Databending :: lettura a tessere: mosaico di blocchi sbagliati, colori a parte (YCrCb).",
+        {"db_scan": "Blocchi", "db_tile": 32, "db_space": "YCrCb", "db_echo": 0.6, "db_invert": 0.5,
+         "db_crush": 0.4, "db_reverb": 0.1, "db_burn": 0.0}),
+    "Confetti saturo": ("Tab 4 Residuo :: i residui dei P-frame si accumulano: colori saturi e coriandoli sui bordi (stile del video di riferimento).",
+        {"rs_luma": 1.25, "rs_chroma": 2.0, "rs_quant": 8.0, "rs_block": 16, "rs_strength": 1.0, "rs_hold": 0.0, "rs_asr": 0.5}),
+    "Confetti fine": ("Tab 4 Residuo :: coriandoli piccoli e fitti, immagine piu' leggibile.",
+        {"rs_luma": 1.15, "rs_chroma": 1.8, "rs_quant": 4.0, "rs_block": 8, "rs_asr": 0.5}),
+    "Confetti a ondate": ("Tab 4 Residuo :: la saturazione sale e sui colpi forti si azzera: cicli a tempo col brano.",
+        {"trigger": "Beat (a tempo)", "rs_luma": 1.3, "rs_chroma": 2.4, "rs_quant": 10.0, "rs_refresh": True,
+         "rs_refresh_thr": 0.9, "rs_asr": 1.0}),
+    "Residuo estremo": ("Tab 4 Residuo :: guadagni alti e grana grossa: immagine quasi distrutta, colori impazziti.",
+        {"rs_luma": 1.5, "rs_chroma": 3.5, "rs_quant": 24.0, "rs_hold": 0.05, "rs_asr": 0.5}),
     "Cassa, rullante, hi-hat": ("Tab 1 Byte :: modo bande: la cassa toglie gli I-frame, il rullante rinfresca, gli hi-hat corrompono.",
         {"bands": True, "drop_mode": "Su onset", "corrupt": 0.003, "max_dup": 14, "kf": 8}),
 }
@@ -900,7 +1048,8 @@ def run_databend(preview):
              "db_drv": {k: st.session_state["db_d_" + k] for k in FX}, "delay": st.session_state["db_delay"],
              "align": st.session_state["db_align"], "release": st.session_state["db_release"],
              "mem": st.session_state["db_mem"], "zone": st.session_state["db_zone"],
-             "fps_img": st.session_state["db_fps"]}
+             "fps_img": st.session_state["db_fps"], "scan": st.session_state["db_scan"],
+             "space": st.session_state["db_space"], "tile": st.session_state["db_tile"]}
         p["au"] = au_for(pa, pau, p["max_sec"], fps=float(p["fps_img"]) if pi else None)
         if pi and not p["au"]["ok"]:
             raise RuntimeError("Audio non leggibile / audio unreadable")
@@ -916,7 +1065,31 @@ def run_databend(preview):
         return False
 
 
-tab1, tab2, tab3 = st.tabs(["1 // BYTE (AVI)", "2 // OPTICAL FLOW", "3 // DATABENDING"])
+def run_residual(preview):
+    tmp, pa, pb, pau, _i = save_uploads()
+    try:
+        ss = st.session_state
+        p = {**common(preview), "res_luma": ss["rs_luma"], "res_chroma": ss["rs_chroma"],
+             "res_quant": ss["rs_quant"], "block": int(ss["rs_block"]), "strength": ss["rs_strength"],
+             "mv_noise": ss["rs_mv_noise"], "hold_prob": ss["rs_hold"], "a_bloom": ss["rs_bloom"],
+             "bloom_gain": ss["rs_bloom_gain"], "bloom_len": (int(ss["rs_bloom_len"][0]), int(ss["rs_bloom_len"][1])),
+             "a_strength": ss["rs_asr"], "a_refresh": ss["rs_refresh"], "refresh_thr": ss["rs_refresh_thr"],
+             "flow_engine": ss["flow_engine"]}
+        p["au"] = au_for(pa, pau, p["max_sec"])
+        raw, final = os.path.join(tmp, "raw.mp4"), os.path.join(tmp, "out.mp4")
+        bar = st.progress(0.0)
+        fps, stt = residual_video(pa, pb, raw, p, progress_cb=lambda v: bar.progress(min(1.0, v)))
+        finalize_h264(raw, pau or pa, final, keep_audio, p["max_sec"])
+        bar.empty()
+        stt["transfer"] = pb is not None
+        publish(final, "RESIDUAL", p, fps, stt, preview)
+        return True
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Errore / Error :: {e}")
+        return False
+
+
+tab1, tab2, tab3, tab4 = st.tabs(["1 // BYTE (AVI)", "2 // OPTICAL FLOW", "3 // DATABENDING", "4 // RESIDUO"])
 
 with tab1:
     st.write("Elimina I-frame, duplica P-frame e corrompe byte :: guidato dall'audio. "
@@ -967,6 +1140,12 @@ with tab3:
              "un'immagine fissa che si anima col brano (Immagine + Audio esterno). Se carichi entrambi, usa l'immagine.")
     labels = {"echo": "Eco / Echo", "reverb": "Riverbero / Reverb", "invert": "Inverti / Invert", "burn": "Amplifica / Burn",
               "crush": "Bitcrush", "hp": "Passa-alto / Edge", "dist": "Distorsione / Distortion", "slip": "Slittamento byte / Slip"}
+    s1, s2, s3 = st.columns(3)
+    s1.radio("Scansione / Scan", OPTS["db_scan"], key="db_scan", horizontal=True,
+             help="Orizzontale = righe; Verticale = colate; Blocchi = mosaico di tessere.")
+    s2.radio("Spazio colore / Color space", OPTS["db_space"], key="db_space", horizontal=True,
+             help="YCrCb separa luminosita' e colore: le distorsioni cambiano aspetto.")
+    s3.select_slider("Tessera (solo Blocchi) / Tile", OPTS["db_tile"], key="db_tile")
     cols = st.columns(4)
     for i, k in enumerate(FX):
         cols[i % 4].slider(labels[k], 0.0, 1.0, step=0.05, key="db_" + k)
@@ -988,6 +1167,32 @@ with tab3:
     pv3 = r2.button("ANTEPRIMA / PREVIEW", disabled=nodata, key="pv3")
     if go3 or pv3:
         finish(run_databend(pv3), pv3)
+
+
+with tab4:
+    st.write("Simula un decoder che accumula i residui dei P-frame senza mai azzerare l'errore: colori saturi, coriandoli "
+             "sui bordi e code dove ci si muove. Il Video B (opzionale) diventa l'immagine di partenza.")
+    a, b, c = st.columns(3)
+    a.slider("Guadagno luma / Luma gain", 0.0, 3.0, step=0.05, key="rs_luma")
+    b.slider("Guadagno colore / Chroma gain", 0.0, 4.0, step=0.05, key="rs_chroma")
+    c.slider("Quantizzazione (grana) / Quantization", 0.0, 48.0, step=1.0, key="rs_quant")
+    with st.expander("Avanzati / Advanced"):
+        a4, b4, c4 = st.columns(3)
+        a4.select_slider("Blocco / Block", OPTS["rs_block"], key="rs_block")
+        a4.slider("Forza movimento / Motion strength", 0.2, 4.0, step=0.1, key="rs_strength")
+        a4.slider("Rumore MV / MV noise", 0.0, 8.0, step=0.5, key="rs_mv_noise")
+        b4.slider("RMS -> guadagno / gain", 0.0, 3.0, step=0.1, key="rs_asr")
+        b4.checkbox("Onset -> bloom", key="rs_bloom")
+        b4.checkbox("Onset forte -> azzera accumulo / refresh", key="rs_refresh")
+        b4.slider("Soglia refresh / Refresh thr", 0.5, 1.0, step=0.05, key="rs_refresh_thr")
+        c4.slider("Hold prob", 0.0, 0.5, step=0.01, key="rs_hold")
+        c4.slider("Bloom gain", 1.0, 5.0, step=0.1, key="rs_bloom_gain")
+        c4.slider("Bloom durata / length", 2, 60, key="rs_bloom_len")
+    r1, r2 = st.columns(2)
+    go4 = r1.button("GENERA RESIDUO / GENERATE", type="primary", disabled=up_a is None)
+    pv4 = r2.button("ANTEPRIMA / PREVIEW", disabled=up_a is None, key="pv4")
+    if (go4 or pv4) and up_a is not None:
+        finish(run_residual(pv4), pv4)
 
 
 def dl_button(*args, **kw):
