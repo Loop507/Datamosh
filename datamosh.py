@@ -14,6 +14,7 @@ Minimalismo Computazionale / Glitch Brutalista.
 import json
 import os
 import random
+import re
 import struct
 import subprocess
 import tempfile
@@ -822,7 +823,7 @@ PRESETS = {
         {"mode": "Block MV", "block": 32, "strength": 2.0, "mv_noise": 2.0, "a_bloom": True}),
     "Mosh a ondate": ("Tab 2 Optical :: il movimento si accumula, sui colpi forti l'immagine si rinfresca. A ondate col brano.",
         {"trigger": "Beat (a tempo)", "a_refresh": True, "refresh_thr": 0.9, "bloom_len": (8, 30)}),
-    "Un video mangia l'altro": ("Tab 1, 2 o 4 :: carica Video A (movimento) e Video B (immagine): A deforma B.",
+    "Un video mangia l'altro": ("Tab 2 Optical (vale anche per 1 e 4) :: carica Video A (movimento) e Video B (immagine): A deforma B.",
         {"mode": "Block MV", "block": 16, "mosh_range": (0, 100), "residual": 0.0}),
     "Vernice fresca": ("Tab 3 Databending :: pixel trascinati come vernice fresca, a ritmo di volume.",
         {"db_reverb": 0.9, "db_echo": 0.2, "db_invert": 0.0, "db_burn": 0.0, "db_crush": 0.0,
@@ -860,9 +861,19 @@ if st.session_state["counter_pending"]:  # dopo un render finale: prossimo numer
     st.session_state["counter_pending"] = False
 
 
+TAB_LABELS = ["1 // BYTE (AVI)", "2 // OPTICAL FLOW", "3 // DATABENDING", "4 // RESIDUO"]
+
+
+def tab_of(name):
+    """Numero del tab (1-4) per cui e' pensato il preset: lo ricavo dalla descrizione ('Tab 4 Residuo :: ...')."""
+    m = re.match(r"Tab (\d)", PRESETS[name][0])
+    return int(m.group(1)) if m else 1
+
+
 def apply_preset():
     name = st.session_state["preset"]
     if name in PRESETS:
+        st.session_state["active_tab"] = TAB_LABELS[tab_of(name) - 1]  # apre il tab del preset
         for k, v in {**DEFAULTS, **PRESETS[name][1]}.items():
             if k not in KEEP:
                 st.session_state[k] = v
@@ -909,8 +920,9 @@ def params_json():
     return json.dumps({k: st.session_state[k] for k in DEFAULTS}, indent=1)
 
 
-st.selectbox("Preset (riporta i controlli ai valori del preset, poi puoi ritoccarli)",
-             [MANUAL] + list(PRESETS), key="preset", on_change=apply_preset)
+st.selectbox("Preset (imposta i controlli e apre il tab giusto; poi puoi ritoccarli)",
+             [MANUAL] + sorted(PRESETS, key=tab_of), key="preset", on_change=apply_preset,
+             format_func=lambda n: n if n == MANUAL else f"[{tab_of(n)}] {n}")
 if st.session_state["preset"] in PRESETS:
     st.caption(PRESETS[st.session_state["preset"]][0])
 
@@ -1089,7 +1101,10 @@ def run_residual(preview):
         return False
 
 
-tab1, tab2, tab3, tab4 = st.tabs(["1 // BYTE (AVI)", "2 // OPTICAL FLOW", "3 // DATABENDING", "4 // RESIDUO"])
+try:  # Streamlit recente: i tab ricordano la selezione e si possono cambiare da codice
+    tab1, tab2, tab3, tab4 = st.tabs(TAB_LABELS, key="active_tab", on_change="rerun")
+except TypeError:  # versione vecchia: nessun cambio automatico di tab
+    tab1, tab2, tab3, tab4 = st.tabs(TAB_LABELS)
 
 with tab1:
     st.write("Elimina I-frame, duplica P-frame e corrompe byte :: guidato dall'audio. "
