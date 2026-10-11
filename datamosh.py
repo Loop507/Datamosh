@@ -11,6 +11,7 @@ i vettori di movimento a un'immagine "vecchia". Qui lo simuliamo:
 Minimalismo Computazionale / Glitch Brutalista.
 """
 
+import hashlib
 import json
 import os
 import random
@@ -19,11 +20,16 @@ import struct
 import subprocess
 import tempfile
 
+from scipy.signal import lfilter
 import cv2
 import librosa
 import numpy as np
-from scipy.signal import lfilter
 import streamlit as st
+
+
+# ============================================================================
+# AUDIO: analisi (RMS, onset, beat, bande) e instradamento dei segnali
+# ============================================================================
 
 try:
     import imageio_ffmpeg
@@ -32,11 +38,131 @@ except Exception:  # fallback: ffmpeg di sistema
     FFMPEG = "ffmpeg"
 
 
-# ----------------------------------------------------------------------------
-# DSP
-# ----------------------------------------------------------------------------
 def at(arr, k):
     return float(arr[min(int(k), len(arr) - 1)])
+
+
+def zero_au(n):
+    keys = ("rms", "onset", "beat", "low", "mid", "high", "trig_bloom", "trig_drop",
+            "trig_refresh", "corr", "noise")
+    au = {k: np.zeros(n) for k in keys}
+    au.update({"bpm": 0.0, "ok": False, "dur": 0.0, "beats": []})
+    return au
+
+
+def analyze_audio(src, max_sec):
+    """Parte pesante (da tenere in cache): decodifica e analisi. Ritorna None se non c'e' audio."""
+    wav = os.path.join(tempfile.mkdtemp(), "a.wav")
+    try:
+        subprocess.run([FFMPEG, "-y", "-i", src, "-t", str(max_sec), "-vn", "-ac", "1",
+                        "-ar", "22050", wav], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        y, sr = librosa.load(wav, sr=22050, mono=True)
+    except Exception:  # noqa: BLE001
+        return None
+    if y.size < 4096:
+        return None
+    hop = 512
+    spec = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
+    fq = librosa.fft_frequencies(sr=sr, n_fft=2048)
+    rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+    onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+
+    def band(lo, hi):
+        e = np.log1p(spec[(fq >= lo) & (fq < hi)].sum(axis=0))
+        return np.maximum(0.0, np.diff(e, prepend=e[0]))
+
+    tempo, bt = librosa.beat.beat_track(onset_envelope=onset, sr=sr, hop_length=hop)
+    return {"ft": librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop), "rms": rms,
+            "onset": onset, "low": band(0, 150), "mid": band(150, 2000), "high": band(2000, sr / 2.0),
+            "tempo": float(np.atleast_1d(tempo)[0]),
+            "bt_t": librosa.frames_to_time(bt, sr=sr, hop_length=hop)}
+
+
+def features_from_analysis(an, fps, n_frames, bpm_manual=0.0, accent=4, offset=0.0, downbeat=0):
+    """Parte leggera: porta l'analisi a un valore per frame e costruisce la griglia dei beat.
+    offset = spostamento dei beat in secondi; downbeat = quale battito della battuta e' il primo (0-based)."""
+    if an is None:
+        return zero_au(n_frames)
+    ft = an["ft"]
+    vt = np.arange(n_frames) / fps
+
+    def norm(v):
+        v = np.interp(vt, ft, v[:len(ft)])
+        v = np.where(vt <= ft[-1], v, 0.0)  # oltre la fine dell'audio: silenzio
+        return np.clip(v / (np.percentile(v, 99) + 1e-9), 0, 1)
+
+    bt_t = an["bt_t"]
+    if bpm_manual > 0:  # griglia a BPM fissi, con la fase del primo beat rilevato
+        period = 60.0 / bpm_manual
+        t0 = (bt_t[0] % period) if len(bt_t) else 0.0
+        bt_t, bpm = np.arange(t0, ft[-1], period), float(bpm_manual)
+    else:
+        bpm = an["tempo"]
+        if len(bt_t) >= 4:  # dai beat rilevati: piu' preciso della stima grezza (es. 130,0 invece di 129,2)
+            bpm = float(60.0 / np.median(np.diff(bt_t)))
+    beat, beats = np.zeros(n_frames), []
+    for i, tb in enumerate(np.asarray(bt_t) + offset):
+        is_acc = (i - downbeat) % accent == 0
+        beats.append((float(tb), bool(is_acc)))
+        j = int(round(tb * fps))
+        if 0 <= j < n_frames:
+            beat[j] = 1.0 if is_acc else 0.75  # accento sul primo battito della battuta
+    au = zero_au(n_frames)
+    au.update({"rms": norm(an["rms"]), "onset": norm(an["onset"]), "beat": beat, "bpm": bpm, "ok": True,
+               "low": norm(an["low"]), "mid": norm(an["mid"]), "high": norm(an["high"]),
+               "dur": float(ft[-1]), "beats": beats})
+    return au
+
+
+def audio_features(src, fps, n_frames, max_sec, bpm_manual=0.0, accent=4, offset=0.0, downbeat=0):
+    """RMS, onset, beat e 3 bande (basso/medio/acuto) per frame, normalizzati 0-1 (librosa)."""
+    return features_from_analysis(analyze_audio(src, max_sec), fps, n_frames, bpm_manual, accent, offset, downbeat)
+
+
+def route_audio(au, trigger, bands):
+    """Decide quali segnali pilotano cosa (bloom, drop I-frame, refresh, corruzione, rumore MV)."""
+    def mix(x):
+        if trigger == "Beat (a tempo)":
+            return au["beat"]
+        return np.maximum(x, au["beat"]) if trigger == "Onset + Beat" else x
+
+    if bands:  # bassi -> bloom/I-frame, medi -> refresh, acuti -> corruzione/rumore
+        au["trig_bloom"] = au["trig_drop"] = mix(au["low"])
+        au["trig_refresh"] = mix(au["mid"])
+        au["corr"] = au["high"] + 0.3 * au["rms"]
+        au["noise"] = au["high"].copy()
+    else:
+        au["trig_bloom"] = au["trig_drop"] = au["trig_refresh"] = mix(au["onset"])
+        au["corr"] = au["rms"] + mix(au["onset"])
+        au["noise"] = np.zeros_like(au["rms"])
+    au["onset"] = mix(au["onset"])
+    return au
+
+
+DRIVERS = ["Fisso", "Volume", "Bassi", "Medi", "Acuti", "Colpi/Beat"]
+
+
+def envelope(sig, decay):
+    out, e = np.zeros(len(sig)), 0.0
+    for i, v in enumerate(sig):
+        e = max(float(v), e * decay)
+        out[i] = e
+    return out
+
+
+def driver_env(au, name, decay):
+    key = {"Volume": "rms", "Bassi": "low", "Medi": "mid", "Acuti": "high", "Colpi/Beat": "onset"}.get(name)
+    return None if key is None else envelope(au[key], decay)
+
+# ============================================================================
+# MOTORI VIDEO: byte-level, optical flow, residuo, databending, pixel sorting
+# ============================================================================
+
+def make_writer(path, fps, w, h):
+    """File .avi = MJPG (quasi senza perdite, per i passaggi intermedi); altrimenti mp4v."""
+    code = "MJPG" if str(path).lower().endswith(".avi") else "mp4v"
+    return cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*code), fps, (w, h))
 
 
 def fit_frame(frame, w, h):
@@ -72,12 +198,13 @@ def warp(img, flow, grid_x, grid_y):
                      borderMode=cv2.BORDER_REPLICATE)
 
 
-# ----------------------------------------------------------------------------
-# TRASFORMAZIONI DEL MOTO + MAPPE (tab 2 e 4)
-# ----------------------------------------------------------------------------
 MASKS = ["Ovunque", "Solo dove si muove", "Solo dove e' fermo", "Luminosita' alta", "Luminosita' bassa"]
+
+
 MT_DEFAULTS = {"gx": 0.0, "gy": 0.0, "zoom": 0.0, "zoom_drv": "Colpi/Beat", "rot": 0.0, "shear": 0.0,
                "fluid": 0.0, "shift": 0.0, "mirror": "No", "mask": "Ovunque", "mthr": 1.0}
+
+
 MT_LIM = {"gx": (-8.0, 8.0), "gy": (-8.0, 8.0), "zoom": (-3.0, 3.0), "rot": (-3.0, 3.0), "shear": (-3.0, 3.0),
           "fluid": (0.0, 1.0), "shift": (0.0, 1.0), "mthr": (0.2, 6.0)}
 
@@ -134,10 +261,9 @@ def motion_mask(mt, raw_flow, gray):
     return m if kind == "Luminosita' alta" else 1.0 - m
 
 
-# ----------------------------------------------------------------------------
-# PIXEL SORTING (vettorizzato: nessun ciclo per riga)
-# ----------------------------------------------------------------------------
 PS_KEYS = ["Luminanza", "Tinta", "Saturazione", "Rosso", "Verde", "Blu"]
+
+
 PS_MODES = ["Soglia", "Bordi", "Casuale"]
 
 
@@ -248,7 +374,7 @@ def pixelsort_video(src_video, src_image, out_path, p, progress_cb=None):
     w, h = max(16, int(ow * scale) // 2 * 2), max(16, int(oh * scale) // 2 * 2)
     if src_image:
         img = fit_frame(img, w, h)
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    writer = make_writer(out_path, fps, w, h)
     env = driver_env(au, p["drv"], p["release"])
     start_f, end_f = int(n * p["mosh_start"] / 100), int(n * p["mosh_end"] / 100)
     done = sorted_n = 0
@@ -302,7 +428,7 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
 
     cap_b = cv2.VideoCapture(src_b) if src_b else None
 
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    writer = make_writer(out_path, fps, w, h)
     grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32),
                                  np.arange(h, dtype=np.float32))
 
@@ -319,7 +445,7 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
     writer.write(first)
 
     stats = {"frames": 1, "iframes": 1, "holds": 0, "blooms": 0}
-    bloom_flow, bloom_left = None, 0
+    bloom_flow, bloom_left, b_loaded = None, 0, False
 
     for t in range(1, n_max):
         ok, frame = cap.read()
@@ -335,10 +461,11 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
             out = frame
         else:
             # entrando nella finestra: se c'e' B, la texture di partenza e' B
-            if t == start_f and cap_b is not None:
+            if cap_b is not None and not b_loaded:
                 okb, fb = cap_b.read()
                 if okb:
                     mosh = fit_frame(fb, w, h).astype(np.float32)
+                b_loaded = True
 
             # I-frame di rinfresco
             refresh = (p["iframe_every"] > 0 and (t - start_f) % p["iframe_every"] == 0
@@ -415,7 +542,7 @@ def residual_video(src_a, src_b, out_path, p, progress_cb=None):
     w, h = max(16, int(ow * scale) // 2 * 2), max(16, int(oh * scale) // 2 * 2)
     n_max = min(total, int(p["max_sec"] * fps))
     cap_b = cv2.VideoCapture(src_b) if src_b else None
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    writer = make_writer(out_path, fps, w, h)
     gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
     start_f, end_f = int(n_max * p["mosh_start"] / 100), int(n_max * p["mosh_end"] / 100)
 
@@ -434,7 +561,7 @@ def residual_video(src_a, src_b, out_path, p, progress_cb=None):
     zenv = driver_env(au, mt["zoom_drv"], 0.8) if (mt and au) else None
     step = float(p["res_quant"])
     stt = {"frames": 1, "iframes": 0, "holds": 0, "blooms": 0}
-    bloom_flow, bloom_left = None, 0
+    bloom_flow, bloom_left, b_loaded = None, 0, False
     for t in range(1, n_max):
         ok, fr = cap.read()
         if not ok:
@@ -444,10 +571,11 @@ def residual_video(src_a, src_b, out_path, p, progress_cb=None):
         if not (start_f <= t < end_f):
             out_f, out = cur_f.copy(), frame
         else:
-            if t == start_f and cap_b is not None:
+            if cap_b is not None and not b_loaded:
                 okb, fb = cap_b.read()
                 if okb:
                     out_f = ycc(fit_frame(fb, w, h))
+                b_loaded = True
             if au and p["a_refresh"] and at(au["trig_refresh"], t) > p["refresh_thr"]:
                 out_f = cur_f.copy()  # "I-frame": azzera l'accumulo
                 bloom_left = 0
@@ -471,6 +599,8 @@ def residual_video(src_a, src_b, out_path, p, progress_cb=None):
                 mflow = transform_flow(mflow, mt, 1.0 if zenv is None else at(zenv, t), fs, rng,
                                        gx, gy, p["block"])
             r = cur_f - warp(prev_f, true, gx, gy)  # il residuo che manderebbe l'encoder
+            if p.get("grain", 0) > 0:  # grana: rumore anche dove nulla si muove, cosi' i coriandoli arrivano ovunque
+                r = r + rng.normal(0.0, p["grain"], r.shape).astype(np.float32)
             if step > 0:
                 r = np.round(r / step) * step
             gk = 1.0 + (p["a_strength"] * at(au["rms"], t) if au else 0.0)
@@ -494,6 +624,58 @@ def residual_video(src_a, src_b, out_path, p, progress_cb=None):
     return fps, stt
 
 
+FORMATS = ["Originale", "16:9", "9:16", "1:1"]
+FIT_MODES = ["Ritaglia", "Bordi neri"]
+
+
+def format_size(fmt, max_w):
+    """Dimensioni (pari) per un formato social, con lo stesso numero di pixel in tutti i formati:
+    16:9 usa max_w come larghezza, 9:16 come altezza, 1:1 come 0,75 del lato."""
+    mw = int(max_w)
+    if fmt == "16:9":
+        tw, th = mw, mw * 9 / 16
+    elif fmt == "9:16":
+        tw, th = mw * 9 / 16, mw
+    else:
+        tw = th = mw * 0.75
+    return max(16, int(round(tw / 2)) * 2), max(16, int(round(th / 2)) * 2)
+
+
+def format_video(src, out_avi, tw, th, fit, max_sec):
+    """Porta un video al formato scelto (ritaglio al centro o bordi neri), solo per i secondi che servono."""
+    if fit == "Bordi neri":
+        vf = (f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+              f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:black,setsar=1")
+    else:
+        vf = f"scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th},setsar=1"
+    subprocess.run([FFMPEG, "-y", "-i", src, "-t", str(max_sec), "-an", "-vf", vf, "-c:v", "mjpeg", "-q:v", "2",
+                    out_avi], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return out_avi
+
+
+def format_image(src, out_png, tw, th, fit):
+    img = cv2.imread(src)
+    if img is None:
+        raise RuntimeError("Immagine non leggibile / unreadable image")
+    h, w = img.shape[:2]
+    if fit == "Bordi neri":
+        s = min(tw / w, th / h)
+        rw, rh = min(tw, max(1, int(round(w * s)))), min(th, max(1, int(round(h * s))))
+    else:
+        s = max(tw / w, th / h)
+        rw, rh = max(tw, int(np.ceil(w * s))), max(th, int(np.ceil(h * s)))
+    r = cv2.resize(img, (rw, rh), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
+    canvas = np.zeros((th, tw, 3), np.uint8)
+    if fit == "Bordi neri":
+        y0, x0 = (th - rh) // 2, (tw - rw) // 2
+        canvas[y0:y0 + rh, x0:x0 + rw] = r
+    else:
+        y0, x0 = (rh - th) // 2, (rw - tw) // 2
+        canvas = np.ascontiguousarray(r[y0:y0 + th, x0:x0 + tw])
+    cv2.imwrite(out_png, canvas)
+    return out_png
+
+
 def finalize_h264(raw_path, audio_src, final_path, keep_audio, max_sec):
     """Re-encode in H.264 (compatibile browser) + audio opzionale dalla sorgente."""
     cmd = [FFMPEG, "-y", "-err_detect", "ignore_err", "-i", raw_path]
@@ -506,89 +688,6 @@ def finalize_h264(raw_path, audio_src, final_path, keep_audio, max_sec):
     subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
-# ----------------------------------------------------------------------------
-# AUDIO
-# ----------------------------------------------------------------------------
-def zero_au(n):
-    keys = ("rms", "onset", "beat", "low", "mid", "high", "trig_bloom", "trig_drop",
-            "trig_refresh", "corr", "noise")
-    au = {k: np.zeros(n) for k in keys}
-    au.update({"bpm": 0.0, "ok": False, "dur": 0.0})
-    return au
-
-
-def audio_features(src, fps, n_frames, max_sec, bpm_manual=0.0, accent=4):
-    """RMS, onset, beat e 3 bande (basso/medio/acuto) per frame, normalizzati 0-1 (librosa)."""
-    wav = os.path.join(tempfile.mkdtemp(), "a.wav")
-    try:
-        subprocess.run([FFMPEG, "-y", "-i", src, "-t", str(max_sec), "-vn", "-ac", "1",
-                        "-ar", "22050", wav], check=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        y, sr = librosa.load(wav, sr=22050, mono=True)
-    except Exception:  # noqa: BLE001
-        return zero_au(n_frames)
-    if y.size < 4096:
-        return zero_au(n_frames)
-    hop = 512
-    spec = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
-    fq = librosa.fft_frequencies(sr=sr, n_fft=2048)
-    rms = librosa.feature.rms(y=y, hop_length=hop)[0]
-    onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
-    ft = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
-    vt = np.arange(n_frames) / fps
-
-    def norm(v):
-        v = np.interp(vt, ft, v[:len(ft)])
-        v = np.where(vt <= ft[-1], v, 0.0)  # oltre la fine dell'audio: silenzio
-        return np.clip(v / (np.percentile(v, 99) + 1e-9), 0, 1)
-
-    def band(lo, hi):
-        e = np.log1p(spec[(fq >= lo) & (fq < hi)].sum(axis=0))
-        return norm(np.maximum(0.0, np.diff(e, prepend=e[0])))
-
-    tempo, bt = librosa.beat.beat_track(onset_envelope=onset, sr=sr, hop_length=hop)
-    bt_t = librosa.frames_to_time(bt, sr=sr, hop_length=hop)
-    if bpm_manual > 0:  # griglia a BPM fissi, con la fase del primo beat rilevato
-        period = 60.0 / bpm_manual
-        t0 = (bt_t[0] % period) if len(bt_t) else 0.0
-        bt_t, bpm = np.arange(t0, ft[-1], period), float(bpm_manual)
-    else:
-        bpm = float(np.atleast_1d(tempo)[0])
-    beat = np.zeros(n_frames)
-    for i, tb in enumerate(bt_t):
-        j = int(round(tb * fps))
-        if 0 <= j < n_frames:
-            beat[j] = 1.0 if i % accent == 0 else 0.75  # accento sul primo battito
-    au = zero_au(n_frames)
-    au.update({"rms": norm(rms), "onset": norm(onset), "beat": beat, "bpm": bpm, "ok": True,
-               "low": band(0, 150), "mid": band(150, 2000), "high": band(2000, sr / 2),
-               "dur": float(ft[-1])})
-    return au
-
-
-def route_audio(au, trigger, bands):
-    """Decide quali segnali pilotano cosa (bloom, drop I-frame, refresh, corruzione, rumore MV)."""
-    def mix(x):
-        if trigger == "Beat (a tempo)":
-            return au["beat"]
-        return np.maximum(x, au["beat"]) if trigger == "Onset + Beat" else x
-
-    if bands:  # bassi -> bloom/I-frame, medi -> refresh, acuti -> corruzione/rumore
-        au["trig_bloom"] = au["trig_drop"] = mix(au["low"])
-        au["trig_refresh"] = mix(au["mid"])
-        au["corr"] = au["high"] + 0.3 * au["rms"]
-        au["noise"] = au["high"].copy()
-    else:
-        au["trig_bloom"] = au["trig_drop"] = au["trig_refresh"] = mix(au["onset"])
-        au["corr"] = au["rms"] + mix(au["onset"])
-        au["noise"] = np.zeros_like(au["rms"])
-    au["onset"] = mix(au["onset"])
-    return au
-
-
-# ----------------------------------------------------------------------------
-# BYTE-LEVEL DATAMOSH (AVI / MPEG-4 part 2) -- parser e muxer scritti a mano
-# ----------------------------------------------------------------------------
 def vop_type(b):
     i = b.find(b"\x00\x00\x01\xb6")
     return -1 if i < 0 or i + 4 >= len(b) else b[i + 4] >> 6  # 0=I 1=P 2=B
@@ -744,28 +843,15 @@ def byte_datamosh(src, src_b, out_avi, p):
     return fps, st
 
 
-# ----------------------------------------------------------------------------
-# DATABENDING: pixel -> segnale -> effetti "audio" -> pixel (come Audacity, ma controllabile)
-# ----------------------------------------------------------------------------
 FX = ("echo", "reverb", "invert", "burn", "crush", "hp", "dist", "slip")
-DRIVERS = ["Fisso", "Volume", "Bassi", "Medi", "Acuti", "Colpi/Beat"]
+
+
 FX_IT = {"echo": "eco", "reverb": "riverbero", "invert": "inverti", "burn": "amplifica",
          "crush": "bitcrush", "hp": "passa-alto", "dist": "distorsione", "slip": "slittamento"}
+
+
 FX_EN = {"echo": "echo", "reverb": "reverb", "invert": "invert", "burn": "amplify",
          "crush": "bitcrush", "hp": "high-pass", "dist": "distortion", "slip": "byte slip"}
-
-
-def envelope(sig, decay):
-    out, e = np.zeros(len(sig)), 0.0
-    for i, v in enumerate(sig):
-        e = max(float(v), e * decay)
-        out[i] = e
-    return out
-
-
-def driver_env(au, name, decay):
-    key = {"Volume": "rms", "Bassi": "low", "Medi": "mid", "Acuti": "high", "Colpi/Beat": "onset"}.get(name)
-    return None if key is None else envelope(au[key], decay)
 
 
 def bend_frame(frame, amt, p, rng):
@@ -802,8 +888,9 @@ def bend_frame(frame, amt, p, rng):
                 norm += g ** k
         a = y / norm
     if amt["reverb"] > 0.03:  # coda esponenziale: pixel trascinati come vernice
-        al = 0.5 + 0.485 * amt["reverb"]
+        al = 1.0 - 10.0 ** (-(0.3 + 2.4 * amt["reverb"]))  # da 0.5 a 0.998: coda fino a ~200 pixel
         wet = lfilter([1 - al], [1, -al], a).astype(np.float32)
+        wet = np.where(np.abs(wet) > np.abs(a), wet, a)  # la coda resta solo dove supera l'originale: il contrasto non si spegne
         a = a * (1 - amt["reverb"]) + wet * amt["reverb"]
     if amt["hp"] > 0.03:  # passa-alto: solo i bordi
         low = lfilter([0.1], [1, -0.9], a).astype(np.float32)
@@ -877,7 +964,7 @@ def databend_video(src_video, src_image, out_path, p, progress_cb=None):
     w, h = max(16, int(ow * scale) // 2 * 2), max(16, int(oh * scale) // 2 * 2)
     if src_image:
         img = fit_frame(img, w, h)
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    writer = make_writer(out_path, fps, w, h)
     env = {k: driver_env(au, p["db_drv"][k], p["release"]) for k in FX}
     start_f, end_f = int(n * p["mosh_start"] / 100), int(n * p["mosh_end"] / 100)
     prev, bent, done = None, 0, 0
@@ -907,6 +994,449 @@ def databend_video(src_video, src_image, out_path, p, progress_cb=None):
     return fps, {"frames": done, "bent": bent, "source": "image" if src_image else "video",
                  "fx": dict(p["db_fx"]), "scan": p["scan"], "space": p["space"]}
 
+# ============================================================================
+# PARAMETRI E PRESET (nessuna interfaccia)
+# ============================================================================
+
+ACC = {"4/4": 4, "3/4": 3, "6/8": 6, "2/4": 2}
+
+DEFAULTS = {
+    "seed": 507, "mosh_range": (15, 100), "max_w": 640, "max_sec": 30, "prev_sec": 3,
+    "keep_audio": True, "onset_thr": 0.6, "bloom_prob": 0.02, "trigger": "Onset",
+    "bands": False, "bpm_manual": 0.0, "meter": "4/4", "beat_offset": 0, "downbeat": 1, "show_wave": False, "fmt": "Originale", "fit": "Ritaglia", "flow_engine": "DIS (veloce)",
+    "kf": 12, "qscale": 5, "kf_on_audio": True, "drop_mode": "Su onset", "drop_thr": 0.5,
+    "max_dup": 12, "corrupt": 0.002, "quiet_thr": 0.25,
+    "mode": "Block MV", "block": 16, "strength": 1.5, "mv_noise": 0.0, "hold_prob": 0.05,
+    "bloom_gain": 2.5, "bloom_len": (6, 24), "residual": 0.0, "a_strength": 1.0,
+    "a_bloom": True, "a_refresh": False, "refresh_thr": 0.85,
+    "rs_luma": 1.25, "rs_chroma": 2.0, "rs_quant": 8.0, "rs_block": 16, "rs_strength": 1.0, "rs_mv_noise": 0.0,
+    "rs_hold": 0.0, "rs_bloom": True, "rs_bloom_gain": 2.5, "rs_bloom_len": (6, 24), "rs_asr": 0.5,
+    "rs_refresh": False, "rs_refresh_thr": 0.85, "rs_decay": 0.0, "rs_grain": 2.0,
+    "ps_key": "Luminanza", "ps_imode": "Soglia", "ps_range": (0.25, 0.85), "ps_angle": 0, "ps_maxlen": 0,
+    "ps_skip": 0.0, "ps_reverse": False, "ps_mix": 1.0, "ps_expand": 0.35, "ps_drv": "Colpi/Beat",
+    "ps_release": 0.8, "ps_fps": 30,
+    "db_echo": 0.5, "db_reverb": 0.4, "db_invert": 0.3, "db_burn": 0.3, "db_crush": 0.2, "db_hp": 0.0,
+    "db_dist": 0.0, "db_slip": 0.0,
+    "db_d_echo": "Bassi", "db_d_reverb": "Volume", "db_d_invert": "Colpi/Beat", "db_d_burn": "Medi",
+    "db_d_crush": "Acuti", "db_d_hp": "Acuti", "db_d_dist": "Volume", "db_d_slip": "Colpi/Beat",
+    "db_scan": "Orizzontale", "db_space": "BGR", "db_tile": 32,
+    "db_delay": 0.37, "db_align": False, "db_release": 0.8, "db_mem": 0.0, "db_zone": (0, 100), "db_fps": 30,
+}
+
+for _p in ("mt2", "mt4"):  # trasformazioni del moto: stesse impostazioni, una copia per tab
+    DEFAULTS.update({f"{_p}_{_k}": _v for _k, _v in MT_DEFAULTS.items()})
+
+KEEP = ("fmt", "fit", "beat_offset", "downbeat", "show_wave", "seed", "max_w", "max_sec", "prev_sec", "keep_audio", "bpm_manual", "meter", "flow_engine")
+
+OPTS = {"trigger": ["Onset", "Beat (a tempo)", "Onset + Beat"], "drop_mode": ["Su onset", "Tutti", "Mai"],
+        "mode": ["Block MV", "Optical Flow"], "rs_block": [8, 16, 32, 64], "block": [8, 16, 32, 64], "meter": list(ACC),
+        "max_w": [320, 480, 640, 854, 1280], "fmt": FORMATS, "fit": FIT_MODES, "flow_engine": ["DIS (veloce)", "Farneback"], "ps_fps": [24, 25, 30], "ps_key": PS_KEYS, "ps_imode": PS_MODES, "ps_drv": DRIVERS,
+        "db_fps": [24, 25, 30], "db_scan": ["Orizzontale", "Verticale", "Blocchi"],
+        "db_space": ["BGR", "YCrCb"], "db_tile": [16, 32, 64],
+        **{"db_d_" + k: DRIVERS for k in FX}}
+
+LIM = {"seed": (0, 2**31 - 1), "mosh_range": (0, 100), "max_sec": (2, 180), "prev_sec": (2, 6),
+       "onset_thr": (0.1, 1.0), "bloom_prob": (0.0, 0.3), "bpm_manual": (0.0, 300.0), "beat_offset": (-300, 300), "downbeat": (1, 6),
+       "kf": (6, 120), "qscale": (2, 15), "drop_thr": (0.1, 1.0), "max_dup": (1, 40),
+       "corrupt": (0.0, 0.01), "quiet_thr": (0.0, 0.6), "strength": (0.2, 4.0), "mv_noise": (0.0, 8.0),
+       "hold_prob": (0.0, 0.5), "bloom_gain": (1.0, 5.0), "bloom_len": (2, 60), "residual": (0.0, 0.5),
+       "a_strength": (0.0, 3.0), "refresh_thr": (0.5, 1.0), "db_delay": (0.01, 1.5), "db_release": (0.0, 0.95),
+       "db_mem": (0.0, 0.95), "db_zone": (0, 100), "rs_luma": (0.0, 3.0), "rs_chroma": (0.0, 4.0), "rs_quant": (0.0, 48.0), "rs_strength": (0.2, 4.0),
+       "rs_mv_noise": (0.0, 8.0), "rs_hold": (0.0, 0.5), "rs_bloom_gain": (1.0, 5.0), "rs_bloom_len": (2, 60),
+       "rs_asr": (0.0, 3.0), "rs_refresh_thr": (0.5, 1.0), "rs_decay": (0.0, 0.3), "rs_grain": (0.0, 12.0),
+       "ps_range": (0.0, 1.0), "ps_angle": (0, 175), "ps_maxlen": (0, 400), "ps_skip": (0.0, 0.95),
+       "ps_mix": (0.0, 1.0), "ps_expand": (0.0, 0.6), "ps_release": (0.0, 0.95), **{"db_" + k: (0.0, 1.0) for k in FX}}
+
+for _p in ("mt2", "mt4"):
+    OPTS.update({f"{_p}_zoom_drv": DRIVERS, f"{_p}_mirror": ["No", "Orizzontale", "Verticale"], f"{_p}_mask": MASKS})
+    LIM.update({f"{_p}_{_k}": _v for _k, _v in MT_LIM.items()})
+
+MANUAL = "— manuale —"
+
+PRESETS = {
+    "Glitch ritmico a tempo": ("Tab 1 Byte :: i colpi tolgono gli I-frame e spalmano il movimento, a tempo col brano.",
+        {"trigger": "Beat (a tempo)", "kf": 8, "drop_mode": "Su onset", "max_dup": 12, "corrupt": 0.001}),
+    "Caos totale": ("Tab 1 Byte :: mosh continuo e corruzione pesante.",
+        {"drop_mode": "Tutti", "max_dup": 25, "corrupt": 0.005, "qscale": 8}),
+    "Minimale": ("Tab 1 Byte :: pochi duplicati sugli attacchi forti, quasi nessuna corruzione. Effetto sottile.",
+        {"drop_mode": "Su onset", "drop_thr": 0.7, "max_dup": 6, "corrupt": 0.0, "onset_thr": 0.7}),
+    "Liquido e morbido": ("Tab 2 Optical :: deformazioni fluide, l'immagine resta leggibile.",
+        {"mode": "Optical Flow", "strength": 1.0, "residual": 0.1, "a_strength": 1.5, "hold_prob": 0.0}),
+    "Codec rotto": (
+        "Tab 2 Optical :: macro-blocchi che sbandano a ogni colpo e si ricompongono sul primo battito di ogni battuta.",
+        {
+            'trigger': 'Beat (a tempo)',
+            'mode': 'Block MV',
+            'block': 32,
+            'strength': 1.5,
+            'mv_noise': 1.0,
+            'a_bloom': True,
+            'a_refresh': True,
+            'refresh_thr': 0.9,
+        }),
+    "Mosh a ondate": ("Tab 2 Optical :: il movimento si accumula, sui colpi forti l'immagine si rinfresca. A ondate col brano.",
+        {"trigger": "Beat (a tempo)", "a_refresh": True, "refresh_thr": 0.9, "bloom_len": (8, 30)}),
+    "Un video mangia l'altro": ("Tab 2 Optical (vale anche per 1 e 4) :: carica Video A (movimento) e Video B (immagine): A deforma B.",
+        {"mode": "Block MV", "block": 16, "mosh_range": (0, 100), "residual": 0.0}),
+    "Vernice fresca": (
+        "Tab 3 Databending :: pixel trascinati come vernice fresca, a ritmo di volume.",
+        {
+            'db_reverb': 1.0,
+            'db_echo': 0.2,
+            'db_invert': 0.0,
+            'db_burn': 0.0,
+            'db_crush': 0.0,
+            'db_release': 0.9,
+            'db_mem': 0.6,
+        }),
+    "Schermo bruciato": (
+        "Tab 3 Databending :: luminosita' bruciata, negativi a fasce e distorsione sui colpi.",
+        {
+            'db_burn': 0.6,
+            'db_dist': 0.5,
+            'db_invert': 0.4,
+            'db_echo': 0.0,
+            'db_reverb': 0.1,
+            'db_crush': 0.0,
+            'db_d_burn': 'Bassi',
+            'db_d_invert': 'Colpi/Beat',
+        }),
+    "Fantasma a righe": ("Tab 3 Databending :: sdoppiamenti diagonali e bordi: ghosting a righe.",
+        {"db_echo": 0.9, "db_hp": 0.6, "db_delay": 0.33, "db_reverb": 0.0, "db_invert": 0.0, "db_burn": 0.0,
+         "db_crush": 0.0, "db_d_echo": "Volume"}),
+    "Pioggia digitale": (
+        "Tab 3 Databending :: lettura verticale: colonne che scivolano e si invertono, con code luminose.",
+        {
+            'db_scan': 'Verticale',
+            'db_reverb': 1.0,
+            'db_echo': 0.5,
+            'db_crush': 0.3,
+            'db_slip': 0.5,
+            'db_invert': 0.2,
+            'db_burn': 0.0,
+            'db_d_reverb': 'Volume',
+            'db_mem': 0.3,
+        }),
+    "Blocchi corrotti": ("Tab 3 Databending :: lettura a tessere: mosaico di blocchi sbagliati, colori a parte (YCrCb).",
+        {"db_scan": "Blocchi", "db_tile": 32, "db_space": "YCrCb", "db_echo": 0.6, "db_invert": 0.5,
+         "db_crush": 0.4, "db_reverb": 0.1, "db_burn": 0.0}),
+    "Confetti saturo": (
+        "Tab 4 Residuo :: i residui dei P-frame si accumulano: colori saturi e coriandoli ovunque (stile del video di riferimento).",
+        {
+            'rs_luma': 1.25,
+            'rs_chroma': 2.0,
+            'rs_quant': 8.0,
+            'rs_block': 16,
+            'rs_strength': 1.0,
+            'rs_hold': 0.0,
+            'rs_asr': 0.5,
+            'rs_grain': 2.0,
+        }),
+    "Confetti fine": (
+        "Tab 4 Residuo :: coriandoli piccoli e fitti, immagine piu' leggibile.",
+        {
+            'rs_luma': 1.15,
+            'rs_chroma': 1.8,
+            'rs_quant': 4.0,
+            'rs_block': 8,
+            'rs_asr': 0.5,
+            'rs_grain': 1.5,
+        }),
+    "Confetti a ondate": (
+        "Tab 4 Residuo :: la saturazione sale e sui colpi forti si azzera: cicli a tempo col brano.",
+        {
+            'trigger': 'Beat (a tempo)',
+            'rs_luma': 1.3,
+            'rs_chroma': 2.4,
+            'rs_quant': 10.0,
+            'rs_refresh': True,
+            'rs_refresh_thr': 0.9,
+            'rs_asr': 1.0,
+            'rs_grain': 2.5,
+        }),
+    "Residuo estremo": (
+        "Tab 4 Residuo :: guadagni alti e grana grossa: immagine quasi distrutta, colori impazziti.",
+        {
+            'rs_luma': 1.5,
+            'rs_chroma': 3.5,
+            'rs_quant': 24.0,
+            'rs_hold': 0.05,
+            'rs_asr': 0.5,
+            'rs_grain': 5.0,
+        }),
+    "Zoom a pugno": (
+        "Tab 2 Optical :: lo zoom pulsa sui colpi: il mosh si gonfia verso di te e si azzera sul primo battito.",
+        {
+            'trigger': 'Beat (a tempo)',
+            'mode': 'Block MV',
+            'block': 16,
+            'strength': 1.0,
+            'mt2_zoom': 0.8,
+            'mt2_zoom_drv': 'Colpi/Beat',
+            'mt2_fluid': 0.2,
+            'a_bloom': True,
+            'a_refresh': True,
+            'refresh_thr': 0.9,
+        }),
+    "Colata": (
+        "Tab 2 Optical :: l'immagine cola verso il basso come cera e si ricompone a ogni battuta.",
+        {
+            'trigger': 'Beat (a tempo)',
+            'mode': 'Optical Flow',
+            'strength': 1.0,
+            'mt2_gy': 1.5,
+            'mt2_fluid': 0.3,
+            'residual': 0.04,
+            'a_refresh': True,
+            'refresh_thr': 0.9,
+        }),
+    "Vortice": (
+        "Tab 2 Optical :: il movimento ruota e si avvita: mosh a spirale che si distende a ogni battuta.",
+        {
+            'trigger': 'Beat (a tempo)',
+            'mode': 'Optical Flow',
+            'mt2_rot': 0.6,
+            'mt2_fluid': 0.5,
+            'mt2_zoom': 0.2,
+            'mt2_zoom_drv': 'Fisso',
+            'a_refresh': True,
+            'refresh_thr': 0.9,
+        }),
+    "Specchio": (
+        "Tab 2 Optical :: il moto di sinistra viene specchiato a destra, con zoom a tempo e ripartenza a ogni battuta.",
+        {
+            'trigger': 'Beat (a tempo)',
+            'mode': 'Block MV',
+            'mt2_mirror': 'Orizzontale',
+            'mt2_zoom': 0.3,
+            'mt2_zoom_drv': 'Colpi/Beat',
+            'a_refresh': True,
+            'refresh_thr': 0.9,
+        }),
+    "Confetti sui movimenti": (
+        "Tab 4 Residuo :: coriandoli solo dove qualcosa si muove, il resto resta pulito.",
+        {
+            'mt4_mask': 'Solo dove si muove',
+            'mt4_mthr': 1.0,
+            'rs_grain': 2.5,
+        }),
+    "Confetti a decadimento": (
+        "Tab 4 Residuo :: l'errore svanisce piano piano verso il video reale: ondate di colore.",
+        {
+            'rs_decay': 0.06,
+            'rs_luma': 1.3,
+            'rs_chroma': 2.4,
+            'rs_grain': 3.0,
+        }),
+    "Cascata": ("Tab 5 Pixel sort :: ordinamento verticale: cascate di colore dall'alto, la soglia si allarga sui bassi.",
+        {"ps_angle": 90, "ps_key": "Luminanza", "ps_range": (0.3, 0.9), "ps_expand": 0.4, "ps_drv": "Bassi"}),
+    "Fiamma": ("Tab 5 Pixel sort :: colonne ordinate per tinta e rovesciate: effetto fuoco, scatta sui colpi.",
+        {"ps_angle": 90, "ps_key": "Tinta", "ps_range": (0.2, 0.8), "ps_reverse": True, "ps_expand": 0.35}),
+    "Bordi sciolti": ("Tab 5 Pixel sort :: gli intervalli sono delimitati dai bordi: le forme si sciolgono in orizzontale.",
+        {"ps_imode": "Bordi", "ps_key": "Tinta", "ps_range": (0.2, 0.8), "ps_expand": 0.4}),
+    "Pioggia a tempo": ("Tab 5 Pixel sort :: gocce verticali corte e a tratti, sul tempo del brano.",
+        {"trigger": "Beat (a tempo)", "ps_angle": 90, "ps_maxlen": 80, "ps_skip": 0.3, "ps_expand": 0.5}),
+    "Diagonale a righe": (
+        "Tab 5 Pixel sort :: ordinamento inclinato di 35 gradi per il canale rosso: righe diagonali.",
+        {
+            'ps_angle': 35,
+            'ps_key': 'Rosso',
+            'ps_range': (0.3, 0.8),
+            'ps_maxlen': 80,
+            'ps_expand': 0.15,
+            'ps_drv': 'Volume',
+        }),
+    "Cassa, rullante, hi-hat": ("Tab 1 Byte :: modo bande: la cassa toglie gli I-frame, il rullante rinfresca, gli hi-hat corrompono.",
+        {"bands": True, "drop_mode": "Su onset", "corrupt": 0.003, "max_dup": 14, "kf": 8}),
+}
+
+TAB_LABELS = ["1 // BYTE (AVI)", "2 // OPTICAL FLOW", "3 // DATABENDING", "4 // RESIDUO", "5 // PIXEL SORT"]
+
+def tab_of(name):
+    """Numero del tab (1-4) per cui e' pensato il preset: lo ricavo dalla descrizione ('Tab 4 Residuo :: ...')."""
+    m = re.match(r"Tab (\d)", PRESETS[name][0])
+    return int(m.group(1)) if m else 1
+
+def valid(k, v):
+    d = DEFAULTS[k]
+    if k in OPTS:
+        return v in OPTS[k]
+    if isinstance(d, bool):
+        return isinstance(v, bool)
+    num = (int, float)
+    if isinstance(d, tuple):
+        lo, hi = LIM[k]
+        return (isinstance(v, (list, tuple)) and len(v) == 2 and v[0] <= v[1] and
+                all(isinstance(x, num) and not isinstance(x, bool) and lo <= x <= hi for x in v))
+    lo, hi = LIM[k]
+    return isinstance(v, num) and not isinstance(v, bool) and lo <= v <= hi
+
+
+# ----------------------------------------------------------------------------
+# CATENA DI EFFETTI + COSTRUZIONE DEI PARAMETRI
+# ----------------------------------------------------------------------------
+NONE = "— nessuno —"
+STEPS = {"Byte": "BYTE", "Optical": "OPTICAL", "Databending": "DATABEND", "Residuo": "RESIDUAL",
+         "Pixel sort": "PIXELSORT"}
+DEFAULTS.update({"chain_0": "Databending", "chain_1": "Residuo", "chain_2": NONE})
+OPTS.update({f"chain_{i}": [NONE] + list(STEPS) for i in range(3)})
+TAB_LABELS.append("6 // CATENA")
+PRESETS["Catena sporca"] = (
+    "Tab 6 Catena :: databending leggero, poi pixel sort, poi residuo: tutto insieme sul tuo audio, con l'immagine ancora leggibile.",
+    {
+        'chain_0': 'Databending',
+        'chain_1': 'Pixel sort',
+        'chain_2': 'Residuo',
+        'db_echo': 0.1,
+        'db_reverb': 0.15,
+        'db_invert': 0.05,
+        'db_burn': 0.0,
+        'db_crush': 0.0,
+        'ps_angle': 90,
+        'ps_range': (0.4, 0.75),
+        'ps_expand': 0.05,
+        'ps_skip': 0.7,
+        'ps_maxlen': 80,
+        'rs_luma': 1.1,
+        'rs_chroma': 1.5,
+        'rs_quant': 6.0,
+        'rs_grain': 1.0,
+    })
+PRESETS["Catena a tempo"] = (
+    "Tab 6 Catena :: byte-level e poi pixel sort, agganciati al beat del brano.",
+    {
+        'chain_0': 'Byte',
+        'chain_1': 'Pixel sort',
+        'chain_2': '— nessuno —',
+        'trigger': 'Beat (a tempo)',
+        'kf': 8,
+        'drop_mode': 'Su onset',
+        'corrupt': 0.001,
+        'ps_angle': 90,
+        'ps_range': (0.3, 0.8),
+        'ps_maxlen': 80,
+        'ps_skip': 0.5,
+        'ps_expand': 0.25,
+    })
+
+
+def mt_from_state(ss, pfx):
+    return {k: ss[f"{pfx}_{k}"] for k in MT_DEFAULTS}
+
+
+def common_params(ss, preview=False):
+    return {"seed": int(ss["seed"]), "mosh_start": ss["mosh_range"][0], "mosh_end": ss["mosh_range"][1],
+            "max_w": int(min(ss["max_w"], 240) if preview else ss["max_w"]),
+            "max_sec": int(ss["prev_sec"] if preview else ss["max_sec"]),
+            "onset_thr": ss["onset_thr"], "trigger": ss["trigger"], "bloom_prob": ss["bloom_prob"],
+            "bands": ss["bands"], "bpm_manual": float(ss["bpm_manual"]), "meter": ss["meter"],
+            "fmt": ss["fmt"], "fit": ss["fit"]}
+
+
+def build_params(kind, ss, preview=False):
+    """Parametri di un motore a partire dai valori dei controlli (st.session_state o un dict)."""
+    p = common_params(ss, preview)
+    if kind == "BYTE":
+        p.update({k: ss[k] for k in ("kf", "qscale", "drop_mode", "drop_thr", "max_dup", "corrupt",
+                                     "quiet_thr", "kf_on_audio")})
+    elif kind == "OPTICAL":
+        p.update({"mode": ss["mode"], "block": int(ss["block"]), "strength": ss["strength"],
+                  "mv_noise": ss["mv_noise"], "iframe_every": 0, "iframe_prob": 0.0, "hold_prob": ss["hold_prob"],
+                  "bloom_gain": ss["bloom_gain"], "bloom_len": (int(ss["bloom_len"][0]), int(ss["bloom_len"][1])),
+                  "residual": ss["residual"], "a_strength": ss["a_strength"], "a_bloom": ss["a_bloom"],
+                  "a_refresh": ss["a_refresh"], "refresh_thr": ss["refresh_thr"], "flow_engine": ss["flow_engine"],
+                  "mt": mt_from_state(ss, "mt2")})
+    elif kind == "RESIDUAL":
+        p.update({"res_luma": ss["rs_luma"], "res_chroma": ss["rs_chroma"], "res_quant": ss["rs_quant"],
+                  "block": int(ss["rs_block"]), "strength": ss["rs_strength"], "mv_noise": ss["rs_mv_noise"],
+                  "hold_prob": ss["rs_hold"], "a_bloom": ss["rs_bloom"], "bloom_gain": ss["rs_bloom_gain"],
+                  "bloom_len": (int(ss["rs_bloom_len"][0]), int(ss["rs_bloom_len"][1])),
+                  "a_strength": ss["rs_asr"], "a_refresh": ss["rs_refresh"], "refresh_thr": ss["rs_refresh_thr"],
+                  "flow_engine": ss["flow_engine"], "decay": ss["rs_decay"], "grain": ss["rs_grain"],
+                  "mt": mt_from_state(ss, "mt4")})
+    elif kind == "DATABEND":
+        p.update({"db_fx": {k: ss["db_" + k] for k in FX}, "db_drv": {k: ss["db_d_" + k] for k in FX},
+                  "delay": ss["db_delay"], "align": ss["db_align"], "release": ss["db_release"],
+                  "mem": ss["db_mem"], "zone": ss["db_zone"], "fps_img": ss["db_fps"], "scan": ss["db_scan"],
+                  "space": ss["db_space"], "tile": ss["db_tile"]})
+    elif kind == "PIXELSORT":
+        p.update({"key": ss["ps_key"], "imode": ss["ps_imode"], "range": tuple(ss["ps_range"]),
+                  "angle": int(ss["ps_angle"]), "maxlen": int(ss["ps_maxlen"]), "skip": ss["ps_skip"],
+                  "reverse": ss["ps_reverse"], "mix": ss["ps_mix"], "expand": ss["ps_expand"],
+                  "drv": ss["ps_drv"], "release": ss["ps_release"], "fps_img": ss["ps_fps"]})
+    else:
+        raise ValueError(f"effetto sconosciuto: {kind}")
+    return p
+
+# ============================================================================
+# ESECUZIONE DI EFFETTI E CATENE
+# ============================================================================
+
+def video_fps(path):
+    cap = cv2.VideoCapture(path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    cap.release()
+    return fps
+
+
+def compute_au(ss, src_audio, msec, fps, features=audio_features):
+    """Segnali audio per frame (RMS, onset, beat, bande) gia' instradati secondo trigger e modo bande."""
+    au = features(src_audio, fps, int(msec * fps) + 2, msec, float(ss["bpm_manual"]), ACC[ss["meter"]],
+                   ss["beat_offset"] / 1000.0, int(ss["downbeat"]) - 1)
+    return route_audio(au, ss["trigger"], ss["bands"])
+
+
+def decode_mid(avi, out):
+    """Decodifica l'AVI byte-level (anche rotto) in un AVI MJPG leggibile dal passo successivo."""
+    subprocess.run([FFMPEG, "-y", "-err_detect", "ignore_err", "-i", avi, "-an", "-c:v", "mjpeg", "-q:v", "2", out],
+                   check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def run_engine(kind, p, src_video, src_image, src_b, out_path, progress_cb=None):
+    """Esegue un motore. BYTE scrive un AVI MPEG-4 byte-level; gli altri un video (mp4 o avi MJPG)."""
+    if kind == "BYTE":
+        return byte_datamosh(src_video, src_b, out_path, p)
+    if kind == "DATABEND":
+        return databend_video(src_video, src_image, out_path, p, progress_cb)
+    if kind == "PIXELSORT":
+        return pixelsort_video(src_video, src_image, out_path, p, progress_cb)
+    fn = datamosh_video if kind == "OPTICAL" else residual_video
+    fps, stt = fn(src_video, src_b, out_path, p, progress_cb)
+    stt["transfer"] = src_b is not None
+    return fps, stt
+
+
+def run_chain(steps, ss, preview, src_video, src_image, src_b, au, tmp, progress_cb=None):
+    """steps = nomi degli effetti (chiavi di STEPS) nell'ordine. Ogni passo legge il video del precedente.
+    Ritorna {"fps", "steps": [(kind, p, stt)], "raw"}: raw e' il file da passare a finalize_h264."""
+    kinds = [STEPS[s] for s in steps]
+    if not kinds:
+        raise RuntimeError("Scegli almeno un effetto / pick at least one effect")
+    if src_image and kinds[0] not in ("DATABEND", "PIXELSORT"):
+        raise RuntimeError("L'immagine fissa funziona solo se il primo passo e' Databending o Pixel sort / "
+                           "a still image needs Databending or Pixel sort as the first step")
+    results, cur_video, cur_image, fps, out = [], src_video, src_image, 25.0, None
+    for i, kind in enumerate(kinds):
+        last = i == len(kinds) - 1
+        p = build_params(kind, ss, preview)
+        p["seed"] += 101 * i  # un seme diverso per passo
+        p["au"] = au
+        ext = "avi" if (kind == "BYTE" or not last) else "mp4"
+        out = os.path.join(tmp, f"step{i}.{ext}")
+        cb = (lambda v, i=i: progress_cb((i + v) / len(kinds))) if progress_cb else None
+        fps, stt = run_engine(kind, p, cur_video, cur_image, src_b if i == 0 else None, out, cb)
+        results.append((kind, p, stt))
+        if not last:
+            if kind == "BYTE":
+                dec = os.path.join(tmp, f"step{i}_dec.avi")
+                decode_mid(out, dec)
+                out = dec
+            cur_video, cur_image = out, None
+    return {"fps": fps, "steps": results, "raw": out}
+
+# ============================================================================
+# REPORT BILINGUE (IT/EN), HASHTAG E TAG YOUTUBE
+# ============================================================================
 
 PRESET_EN = {"Manuale": "Manual", "Glitch ritmico a tempo": "Rhythmic Glitch", "Caos totale": "Total Chaos",
              "Minimale": "Minimal", "Liquido e morbido": "Liquid & Soft", "Codec rotto": "Broken Codec",
@@ -917,14 +1447,23 @@ PRESET_EN = {"Manuale": "Manual", "Glitch ritmico a tempo": "Rhythmic Glitch", "
              "Vortice": "Vortex", "Specchio": "Mirror", "Confetti sui movimenti": "Motion Confetti",
              "Confetti a decadimento": "Decaying Confetti", "Cascata": "Waterfall", "Fiamma": "Flame",
              "Bordi sciolti": "Melted Edges", "Pioggia a tempo": "Beat Rain", "Diagonale a righe": "Striped Diagonal", "Confetti fine": "Fine Confetti",
-             "Confetti a ondate": "Confetti Waves", "Residuo estremo": "Extreme Residual", "Pioggia digitale": "Digital Rain", "Blocchi corrotti": "Corrupted Blocks"}
+             "Confetti a ondate": "Confetti Waves", "Catena sporca": "Dirty Chain", "Catena a tempo": "Beat Chain", "Residuo estremo": "Extreme Residual", "Pioggia digitale": "Digital Rain", "Blocchi corrotti": "Corrupted Blocks"}
+
+
 SCAN_EN = {"Orizzontale": "Horizontal", "Verticale": "Vertical", "Blocchi": "Blocks"}
+
+
+FIT_EN = {"Ritaglia": "crop", "Bordi neri": "black bars"}
 TRIG_EN = {"Onset": "Onset", "Beat (a tempo)": "Beat (tempo-locked)", "Onset + Beat": "Onset + Beat"}
 
 
 KEY_EN = {"Luminanza": "Luminance", "Tinta": "Hue", "Saturazione": "Saturation", "Rosso": "Red",
           "Verde": "Green", "Blu": "Blue"}
+
+
 IMODE_EN = {"Soglia": "Threshold", "Bordi": "Edges", "Casuale": "Random"}
+
+
 MT_NAMES = {"zoom": ("zoom", "zoom"), "rot": ("rotazione", "rotation"), "shear": ("shear", "shear"),
             "fluid": ("fluido", "fluid"), "shift": ("blocchi sfasati", "shifted blocks")}
 
@@ -944,12 +1483,77 @@ def mt_desc(mt, it):
     return ", ".join(parts)
 
 
+TAGS = {  # (hashtag centrali, tag YouTube centrale, hashtag finali, tag YouTube finali)
+    "BYTE": (["byte"], ["byte"], ["mpeg4", "avi"], ["mpeg-4", "avi"]),
+    "OPTICAL": (["opticalflow"], ["optical flow"], ["opencv", "motionvectors"], ["opencv", "motion vectors"]),
+    "DATABEND": (["databending"], ["databending"], ["numpy", "scipy"], ["numpy", "scipy"]),
+    "RESIDUAL": (["residualmosh"], ["residual mosh"], ["opencv", "pframe"], ["opencv", "p-frame"]),
+    "PIXELSORT": (["pixelsorting"], ["pixel sorting"], ["numpy", "opencv"], ["numpy", "opencv"]),
+}
+
+
+def step_rows(kind, p, stt, it):
+    """Righe specifiche di un effetto + descrizione DSP."""
+    def yn(v):
+        return ("Sì" if it else "Yes") if v else "No"
+
+    eng = str(p.get("flow_engine", "")).split(" ")[0]
+    if kind == "BYTE":
+        rows = [("Dropped I", stt["dropped_i"]), ("Dups", stt["dups"]), ("Skips", stt["skips"]),
+                ("Corrupt", stt["corrupt"]), ("Keyframe Audio", stt["kf_audio"]), ("Transfer", yn(stt["transfer"]))]
+        dsp = "AVI/MPEG-4 byte-level + librosa"
+    elif kind == "OPTICAL":
+        rows = [("Modo" if it else "Mode", p["mode"]), ("Motore flow" if it else "Flow engine", eng),
+                ("I-frame", stt["iframes"]), ("Hold", stt["holds"]), ("Bloom", stt["blooms"]),
+                ("Transfer", yn(stt["transfer"]))]
+        dsp = f"OpenCV {eng} optical flow + librosa"
+    elif kind == "RESIDUAL":
+        rows = [("Blocco" if it else "Block", p["block"]), ("Motore flow" if it else "Flow engine", eng),
+                ("Guadagno luma" if it else "Luma gain", p["res_luma"]),
+                ("Guadagno colore" if it else "Chroma gain", p["res_chroma"]),
+                ("Quantizzazione" if it else "Quantization", p["res_quant"]),
+                ("I-frame", stt["iframes"]), ("Hold", stt["holds"]), ("Bloom", stt["blooms"]),
+                ("Transfer", yn(stt["transfer"]))]
+        dsp = f"OpenCV {eng} flow + residual accumulation + librosa"
+    elif kind == "PIXELSORT":
+        src = "Video" if stt["source"] == "video" else ("Immagine" if it else "Still image")
+        lo, hi = p["range"]
+        rows = [("Sorgente" if it else "Source", src),
+                ("Chiave" if it else "Key", p["key"] if it else KEY_EN[p["key"]]),
+                ("Intervalli" if it else "Intervals", p["imode"] if it else IMODE_EN[p["imode"]]),
+                ("Soglie" if it else "Range", f"{lo:.2f}-{hi:.2f}"),
+                ("Angolo" if it else "Angle", f"{p['angle']} deg"),
+                ("Lunghezza max" if it else "Max length", p["maxlen"] or "-"),
+                ("Espansione audio" if it else "Audio expansion", f"{p['expand']:.2f} ({p['drv']})"),
+                ("Frame ordinati" if it else "Sorted frames", stt["sorted"])]
+        dsp = "NumPy vectorized pixel sorting + librosa"
+    else:
+        nm = FX_IT if it else FX_EN
+        fx = ", ".join(f"{nm[k]} {v:.2f}" for k, v in stt["fx"].items() if v > 0)
+        src = "Video" if stt["source"] == "video" else ("Immagine" if it else "Still image")
+        rows = [("Sorgente" if it else "Source", src), ("Effetti" if it else "Effects", fx or "-"),
+                ("Scansione" if it else "Scan", stt["scan"] if it else SCAN_EN[stt["scan"]]),
+                ("Spazio colore" if it else "Color space", stt["space"]),
+                ("Frame piegati" if it else "Bent frames", stt["bent"])]
+        dsp = "NumPy/SciPy signal databending + librosa"
+    d = mt_desc(p.get("mt"), it) if kind in ("OPTICAL", "RESIDUAL") else ""
+    if d:
+        rows.append(("Moto" if it else "Motion", d))
+    if kind == "RESIDUAL" and p.get("decay", 0) > 0:
+        rows.append(("Decadimento" if it else "Decay", p["decay"]))
+    if kind == "RESIDUAL" and p.get("grain", 0) > 0:
+        rows.append(("Grana" if it else "Grain", p["grain"]))
+    return rows, dsp
+
+
 def build_report(kind, p, fps, stt, au_ok, preset, num):
-    """Report bilingue (IT + EN), hashtag e tag YouTube in inglese."""
-    byte = kind == "BYTE"
+    """Report bilingue (IT + EN), hashtag e tag YouTube in inglese.
+    kind = un effetto, oppure "CHAIN" con stt = {"steps": [(kind, p, stt), ...]} (p = parametri comuni)."""
+    chain = kind == "CHAIN"
+    steps = stt["steps"] if chain else [(kind, p, stt)]
+    frames = steps[-1][2]["frames"]
     seed = p["seed"]
     preset = "Manuale" if str(preset).startswith("—") else preset
-    eng = str(p.get("flow_engine", "")).split(" ")[0]
 
     def block(lang):
         it = lang == "it"
@@ -958,7 +1562,8 @@ def build_report(kind, p, fps, stt, au_ok, preset, num):
             return ("Sì" if it else "Yes") if v else "No"
 
         note = (" (manuale)" if it else " (manual)") if p.get("bpm_manual", 0) > 0 else ""
-        rows = [("Approccio" if it else "Approach", kind),
+        label = kind if not chain else ("CATENA" if it else "CHAIN") + " (" + " > ".join(k for k, _, _ in steps) + ")"
+        rows = [("Approccio" if it else "Approach", label),
                 ("Preset", preset if it else PRESET_EN.get(preset, preset)),
                 ("Seed", seed), ("FPS", f"{fps:.2f}"),
                 ("Finestra" if it else "Window", f"{p['mosh_start']}% -> {p['mosh_end']}%"),
@@ -966,655 +1571,583 @@ def build_report(kind, p, fps, stt, au_ok, preset, num):
                 ("Trigger", p["trigger"] if it else TRIG_EN.get(p["trigger"], p["trigger"])),
                 ("Bande" if it else "Bands", yn(p["bands"])),
                 ("BPM", f"{p['au'].get('bpm', 0):.1f}{note}"),
-                ("Battuta" if it else "Meter", p["meter"]), ("Frames", stt["frames"])]
-        if byte:
-            rows += [("Dropped I", stt["dropped_i"]), ("Dups", stt["dups"]), ("Skips", stt["skips"]),
-                     ("Corrupt", stt["corrupt"]), ("Keyframe Audio", stt["kf_audio"]),
-                     ("Transfer", yn(stt["transfer"]))]
-            dsp = "AVI/MPEG-4 byte-level + librosa"
-        elif kind == "OPTICAL":
-            rows += [("Modo" if it else "Mode", p["mode"]), ("Motore flow" if it else "Flow engine", eng),
-                     ("I-frame", stt["iframes"]), ("Hold", stt["holds"]), ("Bloom", stt["blooms"]),
-                     ("Transfer", yn(stt["transfer"]))]
-            dsp = f"OpenCV {eng} optical flow + librosa"
-        elif kind == "RESIDUAL":
-            rows += [("Blocco" if it else "Block", p["block"]), ("Motore flow" if it else "Flow engine", eng),
-                     ("Guadagno luma" if it else "Luma gain", p["res_luma"]),
-                     ("Guadagno colore" if it else "Chroma gain", p["res_chroma"]),
-                     ("Quantizzazione" if it else "Quantization", p["res_quant"]),
-                     ("I-frame", stt["iframes"]), ("Hold", stt["holds"]), ("Bloom", stt["blooms"]),
-                     ("Transfer", yn(stt["transfer"]))]
-            dsp = f"OpenCV {eng} flow + residual accumulation + librosa"
-        elif kind == "PIXELSORT":
-            src = "Video" if stt["source"] == "video" else ("Immagine" if it else "Still image")
-            lo, hi = p["range"]
-            rows += [("Sorgente" if it else "Source", src),
-                     ("Chiave" if it else "Key", p["key"] if it else KEY_EN[p["key"]]),
-                     ("Intervalli" if it else "Intervals", p["imode"] if it else IMODE_EN[p["imode"]]),
-                     ("Soglie" if it else "Range", f"{lo:.2f}-{hi:.2f}"),
-                     ("Angolo" if it else "Angle", f"{p['angle']} deg"),
-                     ("Lunghezza max" if it else "Max length", p["maxlen"] or "-"),
-                     ("Espansione audio" if it else "Audio expansion", f"{p['expand']:.2f} ({p['drv']})"),
-                     ("Frame ordinati" if it else "Sorted frames", stt["sorted"])]
-            dsp = "NumPy vectorized pixel sorting + librosa"
-        else:
-            nm = FX_IT if it else FX_EN
-            fx = ", ".join(f"{nm[k]} {v:.2f}" for k, v in stt["fx"].items() if v > 0)
-            src = "Video" if stt["source"] == "video" else ("Immagine" if it else "Still image")
-            rows += [("Sorgente" if it else "Source", src), ("Effetti" if it else "Effects", fx or "-"),
-                     ("Scansione" if it else "Scan", stt["scan"] if it else SCAN_EN[stt["scan"]]),
-                     ("Spazio colore" if it else "Color space", stt["space"]),
-                     ("Frame piegati" if it else "Bent frames", stt["bent"])]
-            dsp = "NumPy/SciPy signal databending + librosa"
-        d = mt_desc(p.get("mt"), it) if kind in ("OPTICAL", "RESIDUAL") else ""
-        if d:
-            rows.append(("Moto" if it else "Motion", d))
-        if kind == "RESIDUAL" and p.get("decay", 0) > 0:
-            rows.append(("Decadimento" if it else "Decay", p["decay"]))
+                ("Battuta" if it else "Meter", p["meter"]), ("Frames", frames)]
+        if p.get("fmt", "Originale") != "Originale":
+            rows.insert(5, ("Formato" if it else "Format",
+                            f"{p['fmt']} ({p['fit'] if it else FIT_EN[p['fit']]})"))
         out = [f"DATAMOSH // N.{num:03d}"] + [f"{k} :: {v}" for k, v in rows]
+        dsps = []
+        for i, (k, pp, ss) in enumerate(steps, 1):
+            r, dsp = step_rows(k, pp, ss, it)
+            dsps.append(dsp)
+            if chain:
+                out.append(f"--- {'Passo' if it else 'Step'} {i}: {k} ---")
+            out += [f"{a} :: {b}" for a, b in r]
+        dsp = dsps[0] if not chain else " > ".join(d.replace(" + librosa", "") for d in dsps) + " + librosa"
         return out + [f"DSP :: {dsp}", "Nessun Modello AI/neurale" if it else "No AI/Neural Models",
                       "Direction & Algorithm :: Loop507"]
 
-    mid = {"BYTE": ["byte"], "OPTICAL": ["opticalflow"], "DATABEND": ["databending"],
-           "RESIDUAL": ["residualmosh"], "PIXELSORT": ["pixelsorting"]}[kind]
-    end = {"BYTE": ["mpeg4", "avi"], "OPTICAL": ["opencv", "motionvectors"], "DATABEND": ["numpy", "scipy"],
-           "RESIDUAL": ["opencv", "pframe"], "PIXELSORT": ["numpy", "opencv"]}[kind]
+    def uniq(items):
+        return list(dict.fromkeys(items))
+
+    kinds = [k for k, _, _ in steps]
+    mid = uniq([t for k in kinds for t in TAGS[k][0]] + (["datamoshchain"] if chain else []))
+    end = uniq([t for k in kinds for t in TAGS[k][2]])
+    ymid = uniq([t for k in kinds for t in TAGS[k][1]] + (["datamosh chain"] if chain else []))
+    yend = uniq([t for k in kinds for t in TAGS[k][3]])
     hashtags = ["datamosh", "loop507"] + mid + ["glitchart", "noai", "generativeaudio", "sounddesign",
         "aftereffects", "motiondesign", "algorithmicart", f"seed{seed}", "proceduralart", "digitalart",
         "experimentalvideo", "experimentalsound", "librosa"] + end + ["datamoshing", "compressionart"]
-    yt = ["datamosh", "loop507", {"BYTE": "byte", "OPTICAL": "optical flow", "DATABEND": "databending", "RESIDUAL": "residual mosh", "PIXELSORT": "pixel sorting"}[kind], "glitch art", "no ai", "generative audio",
-          "sound design", "after effects", "motion design", "algorithmic art", f"seed {seed}", "procedural art",
-          "digital art", "experimental video", "experimental sound", "librosa"] + \
-         {"BYTE": ["mpeg-4", "avi"], "OPTICAL": ["opencv", "motion vectors"], "DATABEND": ["numpy", "scipy"],
-         "RESIDUAL": ["opencv", "p-frame"], "PIXELSORT": ["numpy", "opencv"]}[kind] + ["datamoshing", "compression art"]
+    yt = ["datamosh", "loop507"] + ymid + ["glitch art", "no ai", "generative audio", "sound design",
+          "after effects", "motion design", "algorithmic art", f"seed {seed}", "procedural art", "digital art",
+          "experimental video", "experimental sound", "librosa"] + yend + ["datamoshing", "compression art"]
     sep = "=" * 40
     return "\n".join([sep, "[ ITALIANO ]", sep, *block("it"), "", sep, "[ ENGLISH ]", sep, *block("en"), "",
                       " ".join("#" + t for t in hashtags), "", sep, "[ TAG YOUTUBE — ENGLISH ONLY ]", sep,
                       ", ".join(yt)]) + "\n"
 
+# ============================================================================
+# INTERFACCIA STREAMLIT
+# ============================================================================
 
-# ----------------------------------------------------------------------------
-# UI
-# ----------------------------------------------------------------------------
-st.set_page_config(page_title="DATAMOSH // Loop507", layout="wide")
-st.title("DATAMOSH // Loop507")
-st.caption("Minimalismo Computazionale / Glitch Brutalista :: audio-reactive :: puro DSP, nessuna AI")
-
-ACC = {"4/4": 4, "3/4": 3, "6/8": 6, "2/4": 2}
-DEFAULTS = {
-    "seed": 507, "mosh_range": (15, 100), "max_w": 640, "max_sec": 30, "prev_sec": 3,
-    "keep_audio": True, "onset_thr": 0.6, "bloom_prob": 0.02, "trigger": "Onset",
-    "bands": False, "bpm_manual": 0.0, "meter": "4/4", "flow_engine": "DIS (veloce)",
-    "kf": 12, "qscale": 5, "kf_on_audio": True, "drop_mode": "Su onset", "drop_thr": 0.5,
-    "max_dup": 12, "corrupt": 0.002, "quiet_thr": 0.25,
-    "mode": "Block MV", "block": 16, "strength": 1.5, "mv_noise": 0.0, "hold_prob": 0.05,
-    "bloom_gain": 2.5, "bloom_len": (6, 24), "residual": 0.0, "a_strength": 1.0,
-    "a_bloom": True, "a_refresh": False, "refresh_thr": 0.85,
-    "rs_luma": 1.25, "rs_chroma": 2.0, "rs_quant": 8.0, "rs_block": 16, "rs_strength": 1.0, "rs_mv_noise": 0.0,
-    "rs_hold": 0.0, "rs_bloom": True, "rs_bloom_gain": 2.5, "rs_bloom_len": (6, 24), "rs_asr": 0.5,
-    "rs_refresh": False, "rs_refresh_thr": 0.85, "rs_decay": 0.0,
-    "ps_key": "Luminanza", "ps_imode": "Soglia", "ps_range": (0.25, 0.85), "ps_angle": 0, "ps_maxlen": 0,
-    "ps_skip": 0.0, "ps_reverse": False, "ps_mix": 1.0, "ps_expand": 0.35, "ps_drv": "Colpi/Beat",
-    "ps_release": 0.8, "ps_fps": 30,
-    "db_echo": 0.5, "db_reverb": 0.4, "db_invert": 0.3, "db_burn": 0.3, "db_crush": 0.2, "db_hp": 0.0,
-    "db_dist": 0.0, "db_slip": 0.0,
-    "db_d_echo": "Bassi", "db_d_reverb": "Volume", "db_d_invert": "Colpi/Beat", "db_d_burn": "Medi",
-    "db_d_crush": "Acuti", "db_d_hp": "Acuti", "db_d_dist": "Volume", "db_d_slip": "Colpi/Beat",
-    "db_scan": "Orizzontale", "db_space": "BGR", "db_tile": 32,
-    "db_delay": 0.37, "db_align": False, "db_release": 0.8, "db_mem": 0.0, "db_zone": (0, 100), "db_fps": 30,
-}
-for _p in ("mt2", "mt4"):  # trasformazioni del moto: stesse impostazioni, una copia per tab
-    DEFAULTS.update({f"{_p}_{_k}": _v for _k, _v in MT_DEFAULTS.items()})
-KEEP = ("seed", "max_w", "max_sec", "prev_sec", "keep_audio", "bpm_manual", "meter", "flow_engine")
-OPTS = {"trigger": ["Onset", "Beat (a tempo)", "Onset + Beat"], "drop_mode": ["Su onset", "Tutti", "Mai"],
-        "mode": ["Block MV", "Optical Flow"], "rs_block": [8, 16, 32, 64], "block": [8, 16, 32, 64], "meter": list(ACC),
-        "max_w": [320, 480, 640, 854, 1280], "flow_engine": ["DIS (veloce)", "Farneback"], "ps_fps": [24, 25, 30], "ps_key": PS_KEYS, "ps_imode": PS_MODES, "ps_drv": DRIVERS,
-        "db_fps": [24, 25, 30], "db_scan": ["Orizzontale", "Verticale", "Blocchi"],
-        "db_space": ["BGR", "YCrCb"], "db_tile": [16, 32, 64],
-        **{"db_d_" + k: DRIVERS for k in FX}}
-LIM = {"seed": (0, 2**31 - 1), "mosh_range": (0, 100), "max_sec": (2, 180), "prev_sec": (2, 6),
-       "onset_thr": (0.1, 1.0), "bloom_prob": (0.0, 0.3), "bpm_manual": (0.0, 300.0),
-       "kf": (6, 120), "qscale": (2, 15), "drop_thr": (0.1, 1.0), "max_dup": (1, 40),
-       "corrupt": (0.0, 0.01), "quiet_thr": (0.0, 0.6), "strength": (0.2, 4.0), "mv_noise": (0.0, 8.0),
-       "hold_prob": (0.0, 0.5), "bloom_gain": (1.0, 5.0), "bloom_len": (2, 60), "residual": (0.0, 0.5),
-       "a_strength": (0.0, 3.0), "refresh_thr": (0.5, 1.0), "db_delay": (0.01, 1.5), "db_release": (0.0, 0.95),
-       "db_mem": (0.0, 0.95), "db_zone": (0, 100), "rs_luma": (0.0, 3.0), "rs_chroma": (0.0, 4.0), "rs_quant": (0.0, 48.0), "rs_strength": (0.2, 4.0),
-       "rs_mv_noise": (0.0, 8.0), "rs_hold": (0.0, 0.5), "rs_bloom_gain": (1.0, 5.0), "rs_bloom_len": (2, 60),
-       "rs_asr": (0.0, 3.0), "rs_refresh_thr": (0.5, 1.0), "rs_decay": (0.0, 0.3),
-       "ps_range": (0.0, 1.0), "ps_angle": (0, 175), "ps_maxlen": (0, 400), "ps_skip": (0.0, 0.95),
-       "ps_mix": (0.0, 1.0), "ps_expand": (0.0, 0.6), "ps_release": (0.0, 0.95), **{"db_" + k: (0.0, 1.0) for k in FX}}
-for _p in ("mt2", "mt4"):
-    OPTS.update({f"{_p}_zoom_drv": DRIVERS, f"{_p}_mirror": ["No", "Orizzontale", "Verticale"], f"{_p}_mask": MASKS})
-    LIM.update({f"{_p}_{_k}": _v for _k, _v in MT_LIM.items()})
-MANUAL = "— manuale —"
-PRESETS = {
-    "Glitch ritmico a tempo": ("Tab 1 Byte :: i colpi tolgono gli I-frame e spalmano il movimento, a tempo col brano.",
-        {"trigger": "Beat (a tempo)", "kf": 8, "drop_mode": "Su onset", "max_dup": 12, "corrupt": 0.001}),
-    "Caos totale": ("Tab 1 Byte :: mosh continuo e corruzione pesante.",
-        {"drop_mode": "Tutti", "max_dup": 25, "corrupt": 0.005, "qscale": 8}),
-    "Minimale": ("Tab 1 Byte :: pochi duplicati sugli attacchi forti, quasi nessuna corruzione. Effetto sottile.",
-        {"drop_mode": "Su onset", "drop_thr": 0.7, "max_dup": 6, "corrupt": 0.0, "onset_thr": 0.7}),
-    "Liquido e morbido": ("Tab 2 Optical :: deformazioni fluide, l'immagine resta leggibile.",
-        {"mode": "Optical Flow", "strength": 1.0, "residual": 0.1, "a_strength": 1.5, "hold_prob": 0.0}),
-    "Codec rotto": ("Tab 2 Optical :: macro-blocchi che sbandano a ogni colpo.",
-        {"mode": "Block MV", "block": 32, "strength": 2.0, "mv_noise": 2.0, "a_bloom": True}),
-    "Mosh a ondate": ("Tab 2 Optical :: il movimento si accumula, sui colpi forti l'immagine si rinfresca. A ondate col brano.",
-        {"trigger": "Beat (a tempo)", "a_refresh": True, "refresh_thr": 0.9, "bloom_len": (8, 30)}),
-    "Un video mangia l'altro": ("Tab 2 Optical (vale anche per 1 e 4) :: carica Video A (movimento) e Video B (immagine): A deforma B.",
-        {"mode": "Block MV", "block": 16, "mosh_range": (0, 100), "residual": 0.0}),
-    "Vernice fresca": ("Tab 3 Databending :: pixel trascinati come vernice fresca, a ritmo di volume.",
-        {"db_reverb": 0.9, "db_echo": 0.2, "db_invert": 0.0, "db_burn": 0.0, "db_crush": 0.0,
-         "db_release": 0.9, "db_mem": 0.5}),
-    "Schermo bruciato": ("Tab 3 Databending :: luminosita' bruciata, negativi a fasce e distorsione sui colpi.",
-        {"db_burn": 0.9, "db_dist": 0.7, "db_invert": 0.6, "db_echo": 0.0, "db_reverb": 0.1, "db_crush": 0.0,
-         "db_d_burn": "Bassi", "db_d_invert": "Colpi/Beat"}),
-    "Fantasma a righe": ("Tab 3 Databending :: sdoppiamenti diagonali e bordi: ghosting a righe.",
-        {"db_echo": 0.9, "db_hp": 0.6, "db_delay": 0.33, "db_reverb": 0.0, "db_invert": 0.0, "db_burn": 0.0,
-         "db_crush": 0.0, "db_d_echo": "Volume"}),
-    "Pioggia digitale": ("Tab 3 Databending :: lettura verticale: colature e gocce che cadono dall'alto.",
-        {"db_scan": "Verticale", "db_reverb": 0.8, "db_echo": 0.4, "db_invert": 0.0, "db_burn": 0.0,
-         "db_crush": 0.0, "db_d_reverb": "Volume", "db_mem": 0.3}),
-    "Blocchi corrotti": ("Tab 3 Databending :: lettura a tessere: mosaico di blocchi sbagliati, colori a parte (YCrCb).",
-        {"db_scan": "Blocchi", "db_tile": 32, "db_space": "YCrCb", "db_echo": 0.6, "db_invert": 0.5,
-         "db_crush": 0.4, "db_reverb": 0.1, "db_burn": 0.0}),
-    "Confetti saturo": ("Tab 4 Residuo :: i residui dei P-frame si accumulano: colori saturi e coriandoli sui bordi (stile del video di riferimento).",
-        {"rs_luma": 1.25, "rs_chroma": 2.0, "rs_quant": 8.0, "rs_block": 16, "rs_strength": 1.0, "rs_hold": 0.0, "rs_asr": 0.5}),
-    "Confetti fine": ("Tab 4 Residuo :: coriandoli piccoli e fitti, immagine piu' leggibile.",
-        {"rs_luma": 1.15, "rs_chroma": 1.8, "rs_quant": 4.0, "rs_block": 8, "rs_asr": 0.5}),
-    "Confetti a ondate": ("Tab 4 Residuo :: la saturazione sale e sui colpi forti si azzera: cicli a tempo col brano.",
-        {"trigger": "Beat (a tempo)", "rs_luma": 1.3, "rs_chroma": 2.4, "rs_quant": 10.0, "rs_refresh": True,
-         "rs_refresh_thr": 0.9, "rs_asr": 1.0}),
-    "Residuo estremo": ("Tab 4 Residuo :: guadagni alti e grana grossa: immagine quasi distrutta, colori impazziti.",
-        {"rs_luma": 1.5, "rs_chroma": 3.5, "rs_quant": 24.0, "rs_hold": 0.05, "rs_asr": 0.5}),
-    "Zoom a pugno": ("Tab 2 Optical :: lo zoom pulsa sui colpi: il mosh si gonfia verso di te a tempo col brano.",
-        {"mode": "Block MV", "block": 16, "strength": 1.0, "mt2_zoom": 1.2, "mt2_zoom_drv": "Colpi/Beat",
-         "mt2_fluid": 0.2, "a_bloom": True}),
-    "Colata": ("Tab 2 Optical :: l'immagine cola verso il basso come cera, con movimento liquido.",
-        {"mode": "Optical Flow", "strength": 1.0, "mt2_gy": 3.0, "mt2_fluid": 0.4, "residual": 0.04}),
-    "Vortice": ("Tab 2 Optical :: il movimento ruota e si avvita: mosh a spirale.",
-        {"mode": "Optical Flow", "mt2_rot": 1.0, "mt2_fluid": 0.5, "mt2_zoom": 0.3, "mt2_zoom_drv": "Fisso"}),
-    "Specchio": ("Tab 2 Optical :: il moto di sinistra viene specchiato a destra, con zoom a tempo.",
-        {"mode": "Block MV", "mt2_mirror": "Orizzontale", "mt2_zoom": 0.5, "mt2_zoom_drv": "Colpi/Beat"}),
-    "Confetti sui movimenti": ("Tab 4 Residuo :: coriandoli solo dove qualcosa si muove, il resto resta pulito.",
-        {"mt4_mask": "Solo dove si muove", "mt4_mthr": 1.0}),
-    "Confetti a decadimento": ("Tab 4 Residuo :: l'errore svanisce piano piano verso il video reale: ondate di colore.",
-        {"rs_decay": 0.06, "rs_luma": 1.3, "rs_chroma": 2.4}),
-    "Cascata": ("Tab 5 Pixel sort :: ordinamento verticale: cascate di colore dall'alto, la soglia si allarga sui bassi.",
-        {"ps_angle": 90, "ps_key": "Luminanza", "ps_range": (0.3, 0.9), "ps_expand": 0.4, "ps_drv": "Bassi"}),
-    "Fiamma": ("Tab 5 Pixel sort :: colonne ordinate per tinta e rovesciate: effetto fuoco, scatta sui colpi.",
-        {"ps_angle": 90, "ps_key": "Tinta", "ps_range": (0.2, 0.8), "ps_reverse": True, "ps_expand": 0.35}),
-    "Bordi sciolti": ("Tab 5 Pixel sort :: gli intervalli sono delimitati dai bordi: le forme si sciolgono in orizzontale.",
-        {"ps_imode": "Bordi", "ps_key": "Tinta", "ps_range": (0.2, 0.8), "ps_expand": 0.4}),
-    "Pioggia a tempo": ("Tab 5 Pixel sort :: gocce verticali corte e a tratti, sul tempo del brano.",
-        {"trigger": "Beat (a tempo)", "ps_angle": 90, "ps_maxlen": 80, "ps_skip": 0.3, "ps_expand": 0.5}),
-    "Diagonale a righe": ("Tab 5 Pixel sort :: ordinamento inclinato di 35 gradi per il canale rosso: righe diagonali.",
-        {"ps_angle": 35, "ps_key": "Rosso", "ps_range": (0.15, 0.8), "ps_maxlen": 160, "ps_expand": 0.3,
-         "ps_drv": "Volume"}),
-    "Cassa, rullante, hi-hat": ("Tab 1 Byte :: modo bande: la cassa toglie gli I-frame, il rullante rinfresca, gli hi-hat corrompono.",
-        {"bands": True, "drop_mode": "Su onset", "corrupt": 0.003, "max_dup": 14, "kf": 8}),
-}
-for _k, _v in DEFAULTS.items():
-    st.session_state.setdefault(_k, _v)
-for _k, _v in (("preset", MANUAL), ("dm_out", None), ("dm_report", None), ("counter", 0), ("counter_pending", False)):
-    st.session_state.setdefault(_k, _v)
-if st.session_state["counter_pending"]:  # dopo un render finale: prossimo numero progressivo
-    st.session_state["counter"] += 1
-    st.session_state["counter_pending"] = False
-
-
-TAB_LABELS = ["1 // BYTE (AVI)", "2 // OPTICAL FLOW", "3 // DATABENDING", "4 // RESIDUO", "5 // PIXEL SORT"]
-
-
-def tab_of(name):
-    """Numero del tab (1-4) per cui e' pensato il preset: lo ricavo dalla descrizione ('Tab 4 Residuo :: ...')."""
-    m = re.match(r"Tab (\d)", PRESETS[name][0])
-    return int(m.group(1)) if m else 1
-
-
-def apply_preset():
-    name = st.session_state["preset"]
-    if name in PRESETS:
-        st.session_state["active_tab"] = TAB_LABELS[tab_of(name) - 1]  # apre il tab del preset
-        for k, v in {**DEFAULTS, **PRESETS[name][1]}.items():
-            if k not in KEEP:
-                st.session_state[k] = v
-
-
-def valid(k, v):
-    d = DEFAULTS[k]
-    if k in OPTS:
-        return v in OPTS[k]
-    if isinstance(d, bool):
-        return isinstance(v, bool)
-    num = (int, float)
-    if isinstance(d, tuple):
-        lo, hi = LIM[k]
-        return (isinstance(v, (list, tuple)) and len(v) == 2 and v[0] <= v[1] and
-                all(isinstance(x, num) and not isinstance(x, bool) and lo <= x <= hi for x in v))
-    lo, hi = LIM[k]
-    return isinstance(v, num) and not isinstance(v, bool) and lo <= v <= hi
-
-
-def load_params():
-    up = st.session_state.get("pjson")
-    if up is None:
-        return
+def _in_streamlit():
+    """True solo quando il file gira dentro Streamlit: cosi' i motori si possono importare nei test senza avviare l'interfaccia."""
     try:
-        data, n = json.loads(up.getvalue().decode("utf-8")), 0
-        for k, v in data.items():
-            if k in DEFAULTS and valid(k, v):
-                d = DEFAULTS[k]
-                if isinstance(d, tuple):
-                    v = tuple(v)
-                elif isinstance(d, float):
-                    v = float(v)
-                elif isinstance(d, int) and not isinstance(d, bool):
-                    v = int(v)
-                st.session_state[k] = v
-                n += 1
-        st.session_state["pmsg"] = f"Caricati {n} parametri / loaded {n} params"
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
     except Exception:  # noqa: BLE001
-        st.session_state["pmsg"] = "File JSON non valido / invalid JSON"
+        return False
 
 
-def params_json():
-    return json.dumps({k: st.session_state[k] for k in DEFAULTS}, indent=1)
+if _in_streamlit():
+    # ----------------------------------------------------------------------------
+    # UI
+    # ----------------------------------------------------------------------------
+    st.set_page_config(page_title="DATAMOSH // Loop507", layout="wide")
+    st.title("DATAMOSH // Loop507")
+    st.caption("Minimalismo Computazionale / Glitch Brutalista :: audio-reactive :: puro DSP, nessuna AI")
+
+    for _k, _v in DEFAULTS.items():
+        st.session_state.setdefault(_k, _v)
+    for _k, _v in (("preset", MANUAL), ("dm_out", None), ("dm_report", None), ("counter", 0), ("counter_pending", False)):
+        st.session_state.setdefault(_k, _v)
+    if st.session_state["counter_pending"]:  # dopo un render finale: prossimo numero progressivo
+        st.session_state["counter"] += 1
+        st.session_state["counter_pending"] = False
 
 
-st.selectbox("Preset (imposta i controlli e apre il tab giusto; poi puoi ritoccarli)",
-             [MANUAL] + sorted(PRESETS, key=tab_of), key="preset", on_change=apply_preset,
-             format_func=lambda n: n if n == MANUAL else f"[{tab_of(n)}] {n}")
-if st.session_state["preset"] in PRESETS:
-    st.caption(PRESETS[st.session_state["preset"]][0])
-
-VT = ["mp4", "mov", "avi", "mkv", "webm"]
-c1, c2 = st.columns(2)
-up_a = c1.file_uploader("Video A (movimento + audio) / motion + audio", type=VT, key="a")
-up_b = c2.file_uploader("Video B opzionale (immagine/texture che A deforma)", type=VT, key="b")
-up_au = st.file_uploader("Audio esterno opzionale (il tuo brano: guida il mosh e diventa la colonna sonora)",
-                         type=["wav", "mp3", "flac", "ogg", "m4a", "aac"], key="au")
-up_img = st.file_uploader("Immagine fissa opzionale (solo tab 3 Databending: si anima col brano, serve l'audio esterno)",
-                          type=["png", "jpg", "jpeg", "bmp", "webp"], key="img")
-
-with st.sidebar:
-    st.header("Comuni / Common")
-    seed = st.number_input("Seed", 0, 2**31 - 1, key="seed")
-    st.button("Seed casuale / Random seed",
-              on_click=lambda: st.session_state.update(seed=random.randint(0, 2**31 - 1)))
-    st.number_input("Numero progressivo N. / Counter (nome file e report)", 0, 9999, step=1, key="counter")
-    mosh_range = st.slider("Finestra mosh / window (%)", 0, 100, key="mosh_range")
-    max_w = st.select_slider("Larghezza max / Max width", OPTS["max_w"], key="max_w")
-    max_sec = st.slider("Durata max (s) / Max seconds", 2, 180, key="max_sec")
-    if max_sec > 60:
-        st.caption("Oltre 60 s il render puo' richiedere diversi minuti: prova prima con l'anteprima.")
-    prev_sec = st.slider("Secondi anteprima / Preview seconds", 2, 6, key="prev_sec")
-    keep_audio = st.checkbox("Mantieni audio (A o esterno) / Keep audio", key="keep_audio")
-    trigger = st.radio("Trigger audio", OPTS["trigger"], key="trigger",
-                       help="Beat = scatti precisi sul tempo del brano (battere piu' forte).")
-    onset_thr = st.slider("Soglia onset / Onset threshold", 0.1, 1.0, step=0.05, key="onset_thr")
-    bloom_prob = st.slider("Bloom casuale / Random bloom prob", 0.0, 0.3, step=0.01, key="bloom_prob")
-    with st.expander("Audio avanzato / Advanced audio"):
-        bands = st.checkbox("Modo bande: bassi = I-frame/bloom, medi = refresh, acuti = corruzione", key="bands")
-        bpm_manual = st.number_input("BPM manuale (0 = automatico)", 0.0, 300.0, step=1.0, key="bpm_manual")
-        meter = st.radio("Battuta / Meter", OPTS["meter"], key="meter", horizontal=True)
-    with st.expander("Salva / carica parametri"):
-        st.download_button("Salva parametri (JSON)", params_json(),
-                           file_name="datamosh_params.json", mime="application/json")
-        st.file_uploader("Carica parametri (JSON)", type=["json"], key="pjson", on_change=load_params)
-        if st.session_state.get("pmsg"):
-            st.caption(st.session_state["pmsg"])
 
 
-def save_uploads():
-    tmp = tempfile.mkdtemp()
-    out = []
-    for up in (up_a, up_b, up_au, up_img):
+
+
+    def apply_preset():
+        name = st.session_state["preset"]
+        if name in PRESETS:
+            st.session_state["active_tab"] = TAB_LABELS[tab_of(name) - 1]  # apre il tab del preset
+            for k, v in {**DEFAULTS, **PRESETS[name][1]}.items():
+                if k not in KEEP:
+                    st.session_state[k] = v
+
+
+
+
+    def load_params():
+        up = st.session_state.get("pjson")
         if up is None:
-            out.append(None)
-            continue
-        pth = os.path.join(tmp, up.name)
-        with open(pth, "wb") as f:
+            return
+        try:
+            data, n = json.loads(up.getvalue().decode("utf-8")), 0
+            for k, v in data.items():
+                if k in DEFAULTS and valid(k, v):
+                    d = DEFAULTS[k]
+                    if isinstance(d, tuple):
+                        v = tuple(v)
+                    elif isinstance(d, float):
+                        v = float(v)
+                    elif isinstance(d, int) and not isinstance(d, bool):
+                        v = int(v)
+                    st.session_state[k] = v
+                    n += 1
+            st.session_state["pmsg"] = f"Caricati {n} parametri / loaded {n} params"
+        except Exception:  # noqa: BLE001
+            st.session_state["pmsg"] = "File JSON non valido / invalid JSON"
+
+
+    def params_json():
+        return json.dumps({k: st.session_state[k] for k in DEFAULTS}, indent=1)
+
+
+    st.selectbox("Preset (imposta i controlli e apre il tab giusto; poi puoi ritoccarli)",
+                 [MANUAL] + sorted(PRESETS, key=tab_of), key="preset", on_change=apply_preset,
+                 format_func=lambda n: n if n == MANUAL else f"[{tab_of(n)}] {n}")
+    if st.session_state["preset"] in PRESETS:
+        st.caption(PRESETS[st.session_state["preset"]][0])
+
+    VT = ["mp4", "mov", "avi", "mkv", "webm"]
+    c1, c2 = st.columns(2)
+    up_a = c1.file_uploader("Video A (movimento + audio) / motion + audio", type=VT, key="a")
+    up_b = c2.file_uploader("Video B opzionale (immagine/texture che A deforma)", type=VT, key="b")
+    up_au = st.file_uploader("Audio esterno opzionale (il tuo brano: guida il mosh e diventa la colonna sonora)",
+                             type=["wav", "mp3", "flac", "ogg", "m4a", "aac"], key="au")
+    up_img = st.file_uploader("Immagine fissa opzionale (tab 3 Databending, 5 Pixel sort, 6 Catena: si anima col brano, serve l'audio esterno)",
+                              type=["png", "jpg", "jpeg", "bmp", "webp"], key="img")
+
+    with st.sidebar:
+        st.header("Comuni / Common")
+        seed = st.number_input("Seed", 0, 2**31 - 1, key="seed")
+        st.button("Seed casuale / Random seed",
+                  on_click=lambda: st.session_state.update(seed=random.randint(0, 2**31 - 1)))
+        st.number_input("Numero progressivo N. / Counter (nome file e report)", 0, 9999, step=1, key="counter")
+        mosh_range = st.slider("Finestra mosh / window (%)", 0, 100, key="mosh_range")
+        max_w = st.select_slider("Larghezza max / Max width", OPTS["max_w"], key="max_w",
+                                 help="Per il formato 9:16 e' l'altezza, per 1:1 il lato vale 0,75 volte: stessi pixel in tutti i formati.")
+        st.radio("Formato / Format", OPTS["fmt"], key="fmt", horizontal=True,
+                 help="Originale = come la sorgente. Gli altri portano video, Video B e immagine al formato scelto prima degli effetti.")
+        st.radio("Adattamento al formato / Fit", OPTS["fit"], key="fit", horizontal=True,
+                 help="Ritaglia = riempie il formato tagliando i bordi; Bordi neri = mostra tutta l'immagine.")
+        max_sec = st.slider("Durata max (s) / Max seconds", 2, 180, key="max_sec")
+        if max_sec > 60:
+            st.caption("Oltre 60 s il render puo' richiedere diversi minuti: prova prima con l'anteprima.")
+        prev_sec = st.slider("Secondi anteprima / Preview seconds", 2, 6, key="prev_sec")
+        keep_audio = st.checkbox("Mantieni audio (A o esterno) / Keep audio", key="keep_audio")
+        trigger = st.radio("Trigger audio", OPTS["trigger"], key="trigger",
+                           help="Beat = scatti precisi sul tempo del brano (battere piu' forte).")
+        onset_thr = st.slider("Soglia onset / Onset threshold", 0.1, 1.0, step=0.05, key="onset_thr")
+        bloom_prob = st.slider("Bloom casuale / Random bloom prob", 0.0, 0.3, step=0.01, key="bloom_prob")
+        with st.expander("Audio avanzato / Advanced audio"):
+            bands = st.checkbox("Modo bande: bassi = I-frame/bloom, medi = refresh, acuti = corruzione", key="bands")
+            bpm_manual = st.number_input("BPM manuale (0 = automatico)", 0.0, 300.0, step=1.0, key="bpm_manual")
+            meter = st.radio("Battuta / Meter", OPTS["meter"], key="meter", horizontal=True)
+            st.slider("Spostamento beat (ms) / Beat offset", -300, 300, step=5, key="beat_offset")
+            st.slider("Battito accentato della battuta / Downbeat", 1, 6, key="downbeat")
+        with st.expander("Salva / carica parametri"):
+            st.download_button("Salva parametri (JSON)", params_json(),
+                               file_name="datamosh_params.json", mime="application/json")
+            st.file_uploader("Carica parametri (JSON)", type=["json"], key="pjson", on_change=load_params)
+            if st.session_state.get("pmsg"):
+                st.caption(st.session_state["pmsg"])
+
+
+    def save_uploads():
+        tmp = tempfile.mkdtemp()
+        out = []
+        for up in (up_a, up_b, up_au, up_img):
+            if up is None:
+                out.append(None)
+                continue
+            pth = os.path.join(tmp, up.name)
+            with open(pth, "wb") as f:
+                f.write(up.getbuffer())
+            out.append(pth)
+        return tmp, out[0], out[1], out[2], out[3]
+
+
+
+    @st.cache_data(show_spinner=False, max_entries=8, ttl=3600)
+    def cached_analysis(digest, _path, max_sec):
+        """Analisi audio pesante in cache: la chiave e' il contenuto del file, non i parametri del tempo."""
+        return analyze_audio(_path, max_sec)
+
+
+    def file_digest(path):
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+
+    def au_for(pa, pau, msec, fps=None):
+        return compute_au(st.session_state, pau or pa, msec, fps or video_fps(pa),
+                          features=lambda s, f, n, m, b, a, o, d: features_from_analysis(
+                              cached_analysis(file_digest(s), s, m), f, n, b, a, o, d))
+
+
+    def publish(final, kind, p, fps, stt, preview):
+        num = int(st.session_state["counter"])
+        name = f"DATAMOSH_N.{num:03d}" + ("_anteprima" if preview else "")
+        with open(final, "rb") as f:
+            st.session_state["dm_out"] = f.read()
+        txt = build_report(kind, p, fps, stt, p["au"]["ok"], st.session_state["preset"], num)
+        st.session_state["dm_report"] = {"name": name, "txt": txt, "preview": preview}
+
+
+    def finish(ok, preview):
+        if ok and not preview:
+            st.session_state["counter_pending"] = True
+            st.rerun()
+
+
+    def prepare(kind, ss, preview):
+        """Salva i file, li porta al formato scelto, controlla le combinazioni e calcola l'audio (dall'originale)."""
+        tmp, pa, pb, pau, pi = save_uploads()
+        pi = pi if kind in ("DATABEND", "PIXELSORT", "CHAIN") else None  # l'immagine fissa serve solo a questi
+        if pi and not pau:
+            raise RuntimeError("Per animare l'immagine serve un audio esterno / an audio file is required")
+        first = kind
+        if kind == "CHAIN":
+            names = [ss[f"chain_{i}"] for i in range(3) if ss[f"chain_{i}"] != NONE]
+            if not names:
+                raise RuntimeError("Scegli almeno un effetto / pick at least one effect")
+            first = STEPS[names[0]]
+        img_fps = float(ss["db_fps"] if first == "DATABEND" else ss["ps_fps"]) if pi else None
+        cp = common_params(ss, preview)
+        au = au_for(pa, pau, cp["max_sec"], img_fps)
+        if pi and not au["ok"]:
+            raise RuntimeError("Audio non leggibile / audio unreadable")
+        src = {"tmp": tmp, "video": pa, "b": pb, "image": pi, "audio": pau or pa}
+        if cp["fmt"] != "Originale":
+            tw, th = format_size(cp["fmt"], cp["max_w"])
+            if pi:
+                src["image"] = format_image(pi, os.path.join(tmp, "fmt_img.png"), tw, th, cp["fit"])
+            elif pa:
+                src["video"] = format_video(pa, os.path.join(tmp, "fmt_a.avi"), tw, th, cp["fit"], cp["max_sec"])
+            if pb:
+                src["b"] = format_video(pb, os.path.join(tmp, "fmt_b.avi"), tw, th, cp["fit"], cp["max_sec"])
+        return src, au
+
+
+    def render(kind, ss, preview, src, au, cb=None):
+        """Esegue un effetto (o la catena) e ritorna (video finale, tipo, parametri, fps, statistiche)."""
+        tmp = src["tmp"]
+        video = None if src["image"] else src["video"]
+        msec = common_params(ss, preview)["max_sec"]
+        final = os.path.join(tmp, "out.mp4")
+        if kind == "CHAIN":
+            names = [ss[f"chain_{i}"] for i in range(3) if ss[f"chain_{i}"] != NONE]
+            res = run_chain(names, ss, preview, video, src["image"], src["b"], au, tmp, cb)
+            finalize_h264(res["raw"], src["audio"], final, ss["keep_audio"], msec)
+            return final, kind, res["steps"][0][1], res["fps"], {"frames": res["steps"][-1][2]["frames"],
+                                                                "steps": res["steps"]}
+        p = build_params(kind, ss, preview)
+        p["au"] = au
+        raw = os.path.join(tmp, "raw." + ("avi" if kind == "BYTE" else "mp4"))
+        fps, stt = run_engine(kind, p, video, src["image"], src["b"], raw, cb)
+        finalize_h264(raw, src["audio"], final, ss["keep_audio"], msec)
+        return final, kind, p, fps, stt
+
+
+    def run_effect(kind, preview):
+        """Un effetto (tab 1-5) o la catena (kind = "CHAIN", tab 6): render, download e report."""
+        try:
+            ss = st.session_state
+            src, au = prepare(kind, ss, preview)
+            bar = st.progress(0.0)
+            with st.spinner("Elaborazione / Processing..."):
+                final, k, p, fps, stt = render(kind, ss, preview, src, au, lambda v: bar.progress(min(1.0, v)))
+            bar.empty()
+            publish(final, k, p, fps, stt, preview)
+            return True
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Errore / Error :: {e}")
+            return False
+
+
+    def run_variants(kind):
+        """Quattro anteprime con semi diversi (il primo e' quello attuale): scegli la migliore con un clic."""
+        try:
+            ss = st.session_state
+            src, au = prepare(kind, ss, True)
+            rng = random.Random(int(ss["seed"]))
+            seeds = [int(ss["seed"])] + [rng.randrange(2 ** 31) for _ in range(3)]
+            base = {k: ss[k] for k in DEFAULTS}
+            bar, items = st.progress(0.0), []
+            with st.spinner("Genero 4 varianti / Generating 4 variants..."):
+                for i, sd in enumerate(seeds):
+                    sub = os.path.join(src["tmp"], f"v{i}")
+                    os.makedirs(sub, exist_ok=True)
+                    final = render(kind, dict(base, seed=sd), True, dict(src, tmp=sub), au,
+                                   lambda v, i=i: bar.progress(min(1.0, (i + v) / 4)))[0]
+                    with open(final, "rb") as f:
+                        items.append({"seed": sd, "video": f.read()})
+            bar.empty()
+            st.session_state["dm_variants"] = {"kind": kind, "items": items}
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Errore / Error :: {e}")
+
+
+    def use_seed(seed):
+        st.session_state["seed"] = seed
+
+
+    def show_variants():
+        v = st.session_state.get("dm_variants")
+        if not v:
+            return
+        st.subheader("4 varianti / 4 variants :: " + v["kind"])
+        for i, (col, it) in enumerate(zip(st.columns(4), v["items"])):
+            col.video(it["video"])
+            col.caption(f"seed {it['seed']}")
+            col.button("Usa questo seed / Use this seed", key=f"useseed{i}", on_click=use_seed, args=(it["seed"],))
+
+
+    def waveform_view():
+        """Forma d'onda con i beat rilevati: si vede subito se il tempo e' giusto."""
+        up = up_au or up_a
+        if up is None:
+            st.info("Carica un audio o un video per vedere la forma d'onda.")
+            return
+        ss = st.session_state
+        path = os.path.join(tempfile.mkdtemp(), up.name)
+        with open(path, "wb") as f:
             f.write(up.getbuffer())
-        out.append(pth)
-    return tmp, out[0], out[1], out[2], out[3]
+        fps, msec = 30.0, int(ss["max_sec"])
+        au = features_from_analysis(cached_analysis(file_digest(path), path, msec), fps, int(msec * fps) + 2,
+                                    float(ss["bpm_manual"]), ACC[ss["meter"]], ss["beat_offset"] / 1000.0,
+                                    int(ss["downbeat"]) - 1)
+        if not au["ok"]:
+            st.warning("Audio non leggibile / audio unreadable")
+            return
+        import altair as alt
+        import pandas as pd
+        n = int(min(au["dur"], msec) * fps)
+        df = pd.DataFrame({"t": np.arange(n) / fps, "volume": au["rms"][:n]})
+        bdf = pd.DataFrame(au["beats"], columns=["t", "accent"])
+        bdf = bdf[(bdf["t"] >= 0) & (bdf["t"] <= n / fps)]
+        area = alt.Chart(df).mark_area(opacity=0.45).encode(x=alt.X("t:Q", title="secondi / seconds"),
+                                                            y=alt.Y("volume:Q", title="volume"))
+        rules = alt.Chart(bdf).mark_rule().encode(
+            x="t:Q", color=alt.Color("accent:N", scale=alt.Scale(domain=[True, False], range=["#ff3366", "#888888"]),
+                                     legend=None),
+            strokeWidth=alt.condition(alt.datum.accent, alt.value(2.5), alt.value(1)))
+        chart = (area + rules).properties(height=170)
+        try:
+            st.altair_chart(chart, width="stretch")
+        except TypeError:
+            st.altair_chart(chart, use_container_width=True)
+        st.caption(f"BPM {au['bpm']:.1f} :: battuta {ss['meter']} :: {len(bdf)} battiti (in rosso il primo di ogni "
+                   f"battuta) :: spostamento {ss['beat_offset']} ms")
 
 
-def common(preview=False):
-    return {"seed": int(seed), "mosh_start": mosh_range[0], "mosh_end": mosh_range[1],
-            "max_w": int(min(max_w, 240) if preview else max_w),
-            "max_sec": int(prev_sec if preview else max_sec),
-            "onset_thr": onset_thr, "trigger": trigger, "bloom_prob": bloom_prob,
-            "bands": bands, "bpm_manual": float(bpm_manual), "meter": meter}
 
 
-def au_for(pa, pau, msec, fps=None):
-    if fps is None:
-        cap = cv2.VideoCapture(pa)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        cap.release()
-    au = audio_features(pau or pa, fps, int(msec * fps) + 2, msec, float(bpm_manual), ACC[meter])
-    return route_audio(au, trigger, bands)
+    def motion_controls(pfx):
+        st.caption("Trasformazioni del campo di moto e mappa: dove agisce il mosh.")
+        a, b, c = st.columns(3)
+        a.slider("Gravita' X (+ = destra)", -8.0, 8.0, step=0.5, key=f"{pfx}_gx")
+        a.slider("Gravita' Y (+ = verso il basso)", -8.0, 8.0, step=0.5, key=f"{pfx}_gy")
+        a.radio("Specchio / Mirror", ["No", "Orizzontale", "Verticale"], key=f"{pfx}_mirror", horizontal=True)
+        b.slider("Zoom (+ avanti / - indietro)", -3.0, 3.0, step=0.1, key=f"{pfx}_zoom")
+        b.selectbox("Lo zoom pulsa con", DRIVERS, key=f"{pfx}_zoom_drv")
+        b.slider("Rotazione / Vortice", -3.0, 3.0, step=0.1, key=f"{pfx}_rot")
+        c.slider("Shear", -3.0, 3.0, step=0.1, key=f"{pfx}_shear")
+        c.slider("Fluido (movimento medio)", 0.0, 1.0, step=0.05, key=f"{pfx}_fluid")
+        c.slider("Blocchi sfasati", 0.0, 1.0, step=0.05, key=f"{pfx}_shift")
+        d, e = st.columns(2)
+        d.selectbox("Dove agisce il mosh (mappa)", MASKS, key=f"{pfx}_mask")
+        e.slider("Soglia di movimento della mappa (px)", 0.2, 6.0, step=0.1, key=f"{pfx}_mthr")
 
 
-def publish(final, kind, p, fps, stt, preview):
-    num = int(st.session_state["counter"])
-    name = f"DATAMOSH_N.{num:03d}" + ("_anteprima" if preview else "")
-    with open(final, "rb") as f:
-        st.session_state["dm_out"] = f.read()
-    txt = build_report(kind, p, fps, stt, p["au"]["ok"], st.session_state["preset"], num)
-    st.session_state["dm_report"] = {"name": name, "txt": txt, "preview": preview}
+    st.toggle("Mostra forma d'onda e beat / Show waveform and beats", key="show_wave")
+    if st.session_state["show_wave"]:
+        waveform_view()
 
+    try:  # Streamlit recente: i tab ricordano la selezione e si possono cambiare da codice
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(TAB_LABELS, key="active_tab", on_change="rerun")
+    except TypeError:  # versione vecchia: nessun cambio automatico di tab
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(TAB_LABELS)
 
-def finish(ok, preview):
-    if ok and not preview:
-        st.session_state["counter_pending"] = True
-        st.rerun()
+    with tab1:
+        st.write("Elimina I-frame, duplica P-frame e corrompe byte :: guidato dall'audio. "
+                 "Con il Video B: l'immagine e' di B, il movimento di A.")
+        a, b, c = st.columns(3)
+        drop_mode = a.radio("Elimina I-frame / Drop I-frames", OPTS["drop_mode"], key="drop_mode")
+        max_dup = b.slider("Max duplicati P per onset / Max P dups", 1, 40, key="max_dup")
+        corrupt = c.slider("Corruzione byte / Byte corruption", 0.0, 0.01, step=0.0005, format="%.4f", key="corrupt")
+        with st.expander("Avanzati / Advanced"):
+            a2, b2, c2 = st.columns(3)
+            kf = a2.slider("Keyframe ogni N / Keyframe every N", 6, 120, key="kf")
+            qscale = a2.slider("Qualita' (basso = migliore) / q-scale", 2, 15, key="qscale")
+            kf_on_audio = a2.checkbox("Keyframe sui picchi audio (consigliato)", key="kf_on_audio")
+            drop_thr = b2.slider("Soglia drop I / Drop threshold", 0.1, 1.0, step=0.05, key="drop_thr")
+            quiet_thr = c2.slider("Soglia quiete (recupero sync) / Quiet thr", 0.0, 0.6, step=0.05, key="quiet_thr")
+        r1, r2, r3 = st.columns(3)
+        go1 = r1.button("GENERA BYTE / GENERATE", type="primary", disabled=up_a is None)
+        pv1 = r2.button("ANTEPRIMA / PREVIEW", disabled=up_a is None, key="pv1")
+        var1 = r3.button("4 VARIANTI / 4 VARIANTS", disabled=up_a is None, key="var1")
+        if (go1 or pv1) and up_a is not None:
+            finish(run_effect("BYTE", pv1), pv1)
+        if var1 and up_a is not None:
+            run_variants("BYTE")
 
+    with tab2:
+        st.write("Optical flow :: transfer A->B opzionale :: guidato dall'audio.")
+        a, b, c = st.columns(3)
+        mode = a.radio("Modo / Mode", OPTS["mode"], key="mode")
+        strength = b.slider("Forza / Strength", 0.2, 4.0, step=0.1, key="strength")
+        residual = c.slider("Residuo / Leak", 0.0, 0.5, step=0.01, key="residual")
+        with st.expander("Avanzati / Advanced"):
+            a2, b2, c2 = st.columns(3)
+            block = a2.select_slider("Blocco / Block", OPTS["block"], key="block")
+            a_strength = a2.slider("RMS -> forza / strength", 0.0, 3.0, step=0.1, key="a_strength")
+            a_bloom = a2.checkbox("Onset -> bloom", key="a_bloom")
+            a_refresh = a2.checkbox("Onset forte -> I-frame / strong onset refresh", key="a_refresh")
+            refresh_thr = a2.slider("Soglia refresh / Refresh thr", 0.5, 1.0, step=0.05, key="refresh_thr")
+            mv_noise = b2.slider("Rumore MV / MV noise", 0.0, 8.0, step=0.5, key="mv_noise")
+            hold_prob = b2.slider("Hold prob", 0.0, 0.5, step=0.01, key="hold_prob")
+            flow_engine = b2.radio("Motore flow / Flow engine", OPTS["flow_engine"], key="flow_engine")
+            bloom_gain = c2.slider("Bloom gain", 1.0, 5.0, step=0.1, key="bloom_gain")
+            bloom_len = c2.slider("Bloom durata / length", 2, 60, key="bloom_len")
+        with st.expander("Trasformazioni del moto / Motion transforms"):
+            motion_controls("mt2")
+        r1, r2, r3 = st.columns(3)
+        go2 = r1.button("GENERA OPTICAL / GENERATE", type="primary", disabled=up_a is None)
+        pv2 = r2.button("ANTEPRIMA / PREVIEW", disabled=up_a is None, key="pv2")
+        var2 = r3.button("4 VARIANTI / 4 VARIANTS", disabled=up_a is None, key="var2")
+        if (go2 or pv2) and up_a is not None:
+            finish(run_effect("OPTICAL", pv2), pv2)
+        if var2 and up_a is not None:
+            run_variants("OPTICAL")
 
-def run_byte(preview):
-    tmp, pa, pb, pau, _i = save_uploads()
-    try:
-        p = {**common(preview), "kf": kf, "qscale": qscale, "drop_mode": drop_mode,
-             "drop_thr": drop_thr, "max_dup": max_dup, "corrupt": corrupt,
-             "quiet_thr": quiet_thr, "kf_on_audio": kf_on_audio}
-        p["au"] = au_for(pa, pau, p["max_sec"])
-        avi, final = os.path.join(tmp, "mosh.avi"), os.path.join(tmp, "out.mp4")
-        with st.spinner("Moshing bytes..."):
-            fps, stt = byte_datamosh(pa, pb, avi, p)
-            finalize_h264(avi, pau or pa, final, keep_audio, p["max_sec"])
-        publish(final, "BYTE", p, fps, stt, preview)
-        return True
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Errore / Error :: {e}")
-        return False
-
-
-def run_optical(preview):
-    tmp, pa, pb, pau, _i = save_uploads()
-    try:
-        p = {**common(preview), "mode": mode, "block": int(block), "strength": strength,
-             "mv_noise": mv_noise, "iframe_every": 0, "iframe_prob": 0.0,
-             "hold_prob": hold_prob, "bloom_gain": bloom_gain,
-             "bloom_len": (int(bloom_len[0]), int(bloom_len[1])), "residual": residual,
-             "a_strength": a_strength, "a_bloom": a_bloom, "a_refresh": a_refresh,
-             "refresh_thr": refresh_thr, "flow_engine": flow_engine,
-             "mt": mt_from_state("mt2")}
-        p["au"] = au_for(pa, pau, p["max_sec"])
-        raw, final = os.path.join(tmp, "raw.mp4"), os.path.join(tmp, "out.mp4")
-        bar = st.progress(0.0)
-        fps, stt = datamosh_video(pa, pb, raw, p, progress_cb=lambda v: bar.progress(min(1.0, v)))
-        finalize_h264(raw, pau or pa, final, keep_audio, p["max_sec"])
-        bar.empty()
-        stt["transfer"] = pb is not None
-        publish(final, "OPTICAL", p, fps, stt, preview)
-        return True
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Errore / Error :: {e}")
-        return False
-
-
-def mt_from_state(pfx):
-    return {k: st.session_state[f"{pfx}_{k}"] for k in MT_DEFAULTS}
-
-
-def motion_controls(pfx):
-    st.caption("Trasformazioni del campo di moto e mappa: dove agisce il mosh.")
-    a, b, c = st.columns(3)
-    a.slider("Gravita' X (+ = destra)", -8.0, 8.0, step=0.5, key=f"{pfx}_gx")
-    a.slider("Gravita' Y (+ = verso il basso)", -8.0, 8.0, step=0.5, key=f"{pfx}_gy")
-    a.radio("Specchio / Mirror", ["No", "Orizzontale", "Verticale"], key=f"{pfx}_mirror", horizontal=True)
-    b.slider("Zoom (+ avanti / - indietro)", -3.0, 3.0, step=0.1, key=f"{pfx}_zoom")
-    b.selectbox("Lo zoom pulsa con", DRIVERS, key=f"{pfx}_zoom_drv")
-    b.slider("Rotazione / Vortice", -3.0, 3.0, step=0.1, key=f"{pfx}_rot")
-    c.slider("Shear", -3.0, 3.0, step=0.1, key=f"{pfx}_shear")
-    c.slider("Fluido (movimento medio)", 0.0, 1.0, step=0.05, key=f"{pfx}_fluid")
-    c.slider("Blocchi sfasati", 0.0, 1.0, step=0.05, key=f"{pfx}_shift")
-    d, e = st.columns(2)
-    d.selectbox("Dove agisce il mosh (mappa)", MASKS, key=f"{pfx}_mask")
-    e.slider("Soglia di movimento della mappa (px)", 0.2, 6.0, step=0.1, key=f"{pfx}_mthr")
-
-
-def run_pixelsort(preview):
-    tmp, pa, _, pau, pi = save_uploads()
-    try:
-        if pi and not pau:
-            raise RuntimeError("Per animare l'immagine serve un audio esterno / an audio file is required")
-        ss = st.session_state
-        p = {**common(preview), "key": ss["ps_key"], "imode": ss["ps_imode"], "range": tuple(ss["ps_range"]),
-             "angle": int(ss["ps_angle"]), "maxlen": int(ss["ps_maxlen"]), "skip": ss["ps_skip"],
-             "reverse": ss["ps_reverse"], "mix": ss["ps_mix"], "expand": ss["ps_expand"], "drv": ss["ps_drv"],
-             "release": ss["ps_release"], "fps_img": ss["ps_fps"]}
-        p["au"] = au_for(pa, pau, p["max_sec"], fps=float(p["fps_img"]) if pi else None)
-        if pi and not p["au"]["ok"]:
-            raise RuntimeError("Audio non leggibile / audio unreadable")
-        raw, final = os.path.join(tmp, "raw.mp4"), os.path.join(tmp, "out.mp4")
-        bar = st.progress(0.0)
-        fps, stt = pixelsort_video(None if pi else pa, pi, raw, p, progress_cb=lambda v: bar.progress(min(1.0, v)))
-        finalize_h264(raw, pau or pa, final, keep_audio, p["max_sec"])
-        bar.empty()
-        publish(final, "PIXELSORT", p, fps, stt, preview)
-        return True
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Errore / Error :: {e}")
-        return False
-
-
-def run_databend(preview):
-    tmp, pa, _, pau, pi = save_uploads()
-    try:
-        if pi and not pau:
-            raise RuntimeError("Per animare l'immagine serve un audio esterno / an audio file is required")
-        p = {**common(preview), "db_fx": {k: st.session_state["db_" + k] for k in FX},
-             "db_drv": {k: st.session_state["db_d_" + k] for k in FX}, "delay": st.session_state["db_delay"],
-             "align": st.session_state["db_align"], "release": st.session_state["db_release"],
-             "mem": st.session_state["db_mem"], "zone": st.session_state["db_zone"],
-             "fps_img": st.session_state["db_fps"], "scan": st.session_state["db_scan"],
-             "space": st.session_state["db_space"], "tile": st.session_state["db_tile"]}
-        p["au"] = au_for(pa, pau, p["max_sec"], fps=float(p["fps_img"]) if pi else None)
-        if pi and not p["au"]["ok"]:
-            raise RuntimeError("Audio non leggibile / audio unreadable")
-        raw, final = os.path.join(tmp, "raw.mp4"), os.path.join(tmp, "out.mp4")
-        bar = st.progress(0.0)
-        fps, stt = databend_video(None if pi else pa, pi, raw, p, progress_cb=lambda v: bar.progress(min(1.0, v)))
-        finalize_h264(raw, pau or pa, final, keep_audio, p["max_sec"])
-        bar.empty()
-        publish(final, "DATABEND", p, fps, stt, preview)
-        return True
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Errore / Error :: {e}")
-        return False
-
-
-def run_residual(preview):
-    tmp, pa, pb, pau, _i = save_uploads()
-    try:
-        ss = st.session_state
-        p = {**common(preview), "res_luma": ss["rs_luma"], "res_chroma": ss["rs_chroma"],
-             "res_quant": ss["rs_quant"], "block": int(ss["rs_block"]), "strength": ss["rs_strength"],
-             "mv_noise": ss["rs_mv_noise"], "hold_prob": ss["rs_hold"], "a_bloom": ss["rs_bloom"],
-             "bloom_gain": ss["rs_bloom_gain"], "bloom_len": (int(ss["rs_bloom_len"][0]), int(ss["rs_bloom_len"][1])),
-             "a_strength": ss["rs_asr"], "a_refresh": ss["rs_refresh"], "refresh_thr": ss["rs_refresh_thr"],
-             "flow_engine": ss["flow_engine"], "decay": ss["rs_decay"], "mt": mt_from_state("mt4")}
-        p["au"] = au_for(pa, pau, p["max_sec"])
-        raw, final = os.path.join(tmp, "raw.mp4"), os.path.join(tmp, "out.mp4")
-        bar = st.progress(0.0)
-        fps, stt = residual_video(pa, pb, raw, p, progress_cb=lambda v: bar.progress(min(1.0, v)))
-        finalize_h264(raw, pau or pa, final, keep_audio, p["max_sec"])
-        bar.empty()
-        stt["transfer"] = pb is not None
-        publish(final, "RESIDUAL", p, fps, stt, preview)
-        return True
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Errore / Error :: {e}")
-        return False
-
-
-try:  # Streamlit recente: i tab ricordano la selezione e si possono cambiare da codice
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(TAB_LABELS, key="active_tab", on_change="rerun")
-except TypeError:  # versione vecchia: nessun cambio automatico di tab
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(TAB_LABELS)
-
-with tab1:
-    st.write("Elimina I-frame, duplica P-frame e corrompe byte :: guidato dall'audio. "
-             "Con il Video B: l'immagine e' di B, il movimento di A.")
-    a, b, c = st.columns(3)
-    drop_mode = a.radio("Elimina I-frame / Drop I-frames", OPTS["drop_mode"], key="drop_mode")
-    max_dup = b.slider("Max duplicati P per onset / Max P dups", 1, 40, key="max_dup")
-    corrupt = c.slider("Corruzione byte / Byte corruption", 0.0, 0.01, step=0.0005, format="%.4f", key="corrupt")
-    with st.expander("Avanzati / Advanced"):
-        a2, b2, c2 = st.columns(3)
-        kf = a2.slider("Keyframe ogni N / Keyframe every N", 6, 120, key="kf")
-        qscale = a2.slider("Qualita' (basso = migliore) / q-scale", 2, 15, key="qscale")
-        kf_on_audio = a2.checkbox("Keyframe sui picchi audio (consigliato)", key="kf_on_audio")
-        drop_thr = b2.slider("Soglia drop I / Drop threshold", 0.1, 1.0, step=0.05, key="drop_thr")
-        quiet_thr = c2.slider("Soglia quiete (recupero sync) / Quiet thr", 0.0, 0.6, step=0.05, key="quiet_thr")
-    r1, r2 = st.columns(2)
-    go1 = r1.button("GENERA BYTE / GENERATE", type="primary", disabled=up_a is None)
-    pv1 = r2.button("ANTEPRIMA / PREVIEW", disabled=up_a is None, key="pv1")
-    if (go1 or pv1) and up_a is not None:
-        finish(run_byte(pv1), pv1)
-
-with tab2:
-    st.write("Optical flow :: transfer A->B opzionale :: guidato dall'audio.")
-    a, b, c = st.columns(3)
-    mode = a.radio("Modo / Mode", OPTS["mode"], key="mode")
-    strength = b.slider("Forza / Strength", 0.2, 4.0, step=0.1, key="strength")
-    residual = c.slider("Residuo / Leak", 0.0, 0.5, step=0.01, key="residual")
-    with st.expander("Avanzati / Advanced"):
-        a2, b2, c2 = st.columns(3)
-        block = a2.select_slider("Blocco / Block", OPTS["block"], key="block")
-        a_strength = a2.slider("RMS -> forza / strength", 0.0, 3.0, step=0.1, key="a_strength")
-        a_bloom = a2.checkbox("Onset -> bloom", key="a_bloom")
-        a_refresh = a2.checkbox("Onset forte -> I-frame / strong onset refresh", key="a_refresh")
-        refresh_thr = a2.slider("Soglia refresh / Refresh thr", 0.5, 1.0, step=0.05, key="refresh_thr")
-        mv_noise = b2.slider("Rumore MV / MV noise", 0.0, 8.0, step=0.5, key="mv_noise")
-        hold_prob = b2.slider("Hold prob", 0.0, 0.5, step=0.01, key="hold_prob")
-        flow_engine = b2.radio("Motore flow / Flow engine", OPTS["flow_engine"], key="flow_engine")
-        bloom_gain = c2.slider("Bloom gain", 1.0, 5.0, step=0.1, key="bloom_gain")
-        bloom_len = c2.slider("Bloom durata / length", 2, 60, key="bloom_len")
-    with st.expander("Trasformazioni del moto / Motion transforms"):
-        motion_controls("mt2")
-    r1, r2 = st.columns(2)
-    go2 = r1.button("GENERA OPTICAL / GENERATE", type="primary", disabled=up_a is None)
-    pv2 = r2.button("ANTEPRIMA / PREVIEW", disabled=up_a is None, key="pv2")
-    if (go2 or pv2) and up_a is not None:
-        finish(run_optical(pv2), pv2)
-
-with tab3:
-    st.write("I pixel diventano un segnale audio e passano negli effetti sonori. Funziona su un video (Video A) oppure su "
-             "un'immagine fissa che si anima col brano (Immagine + Audio esterno). Se carichi entrambi, usa l'immagine.")
-    labels = {"echo": "Eco / Echo", "reverb": "Riverbero / Reverb", "invert": "Inverti / Invert", "burn": "Amplifica / Burn",
-              "crush": "Bitcrush", "hp": "Passa-alto / Edge", "dist": "Distorsione / Distortion", "slip": "Slittamento byte / Slip"}
-    s1, s2, s3 = st.columns(3)
-    s1.radio("Scansione / Scan", OPTS["db_scan"], key="db_scan", horizontal=True,
-             help="Orizzontale = righe; Verticale = colate; Blocchi = mosaico di tessere.")
-    s2.radio("Spazio colore / Color space", OPTS["db_space"], key="db_space", horizontal=True,
-             help="YCrCb separa luminosita' e colore: le distorsioni cambiano aspetto.")
-    s3.select_slider("Tessera (solo Blocchi) / Tile", OPTS["db_tile"], key="db_tile")
-    cols = st.columns(4)
-    for i, k in enumerate(FX):
-        cols[i % 4].slider(labels[k], 0.0, 1.0, step=0.05, key="db_" + k)
-    with st.expander("Driver audio per effetto / Audio driver per effect"):
-        dcols = st.columns(4)
+    with tab3:
+        st.write("I pixel diventano un segnale audio e passano negli effetti sonori. Funziona su un video (Video A) oppure su "
+                 "un'immagine fissa che si anima col brano (Immagine + Audio esterno). Se carichi entrambi, usa l'immagine.")
+        labels = {"echo": "Eco / Echo", "reverb": "Riverbero / Reverb", "invert": "Inverti / Invert", "burn": "Amplifica / Burn",
+                  "crush": "Bitcrush", "hp": "Passa-alto / Edge", "dist": "Distorsione / Distortion", "slip": "Slittamento byte / Slip"}
+        s1, s2, s3 = st.columns(3)
+        s1.radio("Scansione / Scan", OPTS["db_scan"], key="db_scan", horizontal=True,
+                 help="Orizzontale = righe; Verticale = colate; Blocchi = mosaico di tessere.")
+        s2.radio("Spazio colore / Color space", OPTS["db_space"], key="db_space", horizontal=True,
+                 help="YCrCb separa luminosita' e colore: le distorsioni cambiano aspetto.")
+        s3.select_slider("Tessera (solo Blocchi) / Tile", OPTS["db_tile"], key="db_tile")
+        cols = st.columns(4)
         for i, k in enumerate(FX):
-            dcols[i % 4].selectbox(labels[k], DRIVERS, key="db_d_" + k)
-    with st.expander("Avanzati / Advanced"):
-        a3, b3, c3 = st.columns(3)
-        a3.slider("Ritardo eco (frazione della larghezza)", 0.01, 1.5, step=0.01, key="db_delay")
-        a3.checkbox("Eco allineato ai pixel (multiplo di 3 byte)", key="db_align")
-        b3.slider("Decadimento effetti / Release", 0.0, 0.95, step=0.05, key="db_release")
-        b3.slider("Memoria (accumulo frame) / Feedback", 0.0, 0.95, step=0.05, key="db_mem")
-        c3.slider("Zona righe (%) / Row zone", 0, 100, key="db_zone")
-        c3.select_slider("FPS (solo immagine fissa)", OPTS["db_fps"], key="db_fps")
-    r1, r2 = st.columns(2)
-    nodata = up_a is None and up_img is None
-    go3 = r1.button("GENERA DATABEND / GENERATE", type="primary", disabled=nodata)
-    pv3 = r2.button("ANTEPRIMA / PREVIEW", disabled=nodata, key="pv3")
-    if go3 or pv3:
-        finish(run_databend(pv3), pv3)
+            cols[i % 4].slider(labels[k], 0.0, 1.0, step=0.05, key="db_" + k)
+        with st.expander("Driver audio per effetto / Audio driver per effect"):
+            dcols = st.columns(4)
+            for i, k in enumerate(FX):
+                dcols[i % 4].selectbox(labels[k], DRIVERS, key="db_d_" + k)
+        with st.expander("Avanzati / Advanced"):
+            a3, b3, c3 = st.columns(3)
+            a3.slider("Ritardo eco (frazione della larghezza)", 0.01, 1.5, step=0.01, key="db_delay")
+            a3.checkbox("Eco allineato ai pixel (multiplo di 3 byte)", key="db_align")
+            b3.slider("Decadimento effetti / Release", 0.0, 0.95, step=0.05, key="db_release")
+            b3.slider("Memoria (accumulo frame) / Feedback", 0.0, 0.95, step=0.05, key="db_mem")
+            c3.slider("Zona righe (%) / Row zone", 0, 100, key="db_zone")
+            c3.select_slider("FPS (solo immagine fissa)", OPTS["db_fps"], key="db_fps")
+        r1, r2, r3 = st.columns(3)
+        nodata = up_a is None and up_img is None
+        go3 = r1.button("GENERA DATABEND / GENERATE", type="primary", disabled=nodata)
+        pv3 = r2.button("ANTEPRIMA / PREVIEW", disabled=nodata, key="pv3")
+        var3 = r3.button("4 VARIANTI / 4 VARIANTS", disabled=nodata, key="var3")
+        if go3 or pv3:
+            finish(run_effect("DATABEND", pv3), pv3)
+        if var3:
+            run_variants("DATABEND")
 
 
-with tab4:
-    st.write("Simula un decoder che accumula i residui dei P-frame senza mai azzerare l'errore: colori saturi, coriandoli "
-             "sui bordi e code dove ci si muove. Il Video B (opzionale) diventa l'immagine di partenza.")
-    a, b, c = st.columns(3)
-    a.slider("Guadagno luma / Luma gain", 0.0, 3.0, step=0.05, key="rs_luma")
-    b.slider("Guadagno colore / Chroma gain", 0.0, 4.0, step=0.05, key="rs_chroma")
-    c.slider("Quantizzazione (grana) / Quantization", 0.0, 48.0, step=1.0, key="rs_quant")
-    with st.expander("Avanzati / Advanced"):
-        a4, b4, c4 = st.columns(3)
-        a4.select_slider("Blocco / Block", OPTS["rs_block"], key="rs_block")
-        a4.slider("Forza movimento / Motion strength", 0.2, 4.0, step=0.1, key="rs_strength")
-        a4.slider("Rumore MV / MV noise", 0.0, 8.0, step=0.5, key="rs_mv_noise")
-        b4.slider("RMS -> guadagno / gain", 0.0, 3.0, step=0.1, key="rs_asr")
-        b4.checkbox("Onset -> bloom", key="rs_bloom")
-        b4.checkbox("Onset forte -> azzera accumulo / refresh", key="rs_refresh")
-        b4.slider("Soglia refresh / Refresh thr", 0.5, 1.0, step=0.05, key="rs_refresh_thr")
-        c4.slider("Hold prob", 0.0, 0.5, step=0.01, key="rs_hold")
-        c4.slider("Bloom gain", 1.0, 5.0, step=0.1, key="rs_bloom_gain")
-        c4.slider("Bloom durata / length", 2, 60, key="rs_bloom_len")
-        c4.slider("Decadimento dell'errore / Decay", 0.0, 0.3, step=0.01, key="rs_decay")
-    with st.expander("Trasformazioni del moto / Motion transforms"):
-        motion_controls("mt4")
-    r1, r2 = st.columns(2)
-    go4 = r1.button("GENERA RESIDUO / GENERATE", type="primary", disabled=up_a is None)
-    pv4 = r2.button("ANTEPRIMA / PREVIEW", disabled=up_a is None, key="pv4")
-    if (go4 or pv4) and up_a is not None:
-        finish(run_residual(pv4), pv4)
+    with tab4:
+        st.write("Simula un decoder che accumula i residui dei P-frame senza mai azzerare l'errore: colori saturi, coriandoli "
+                 "sui bordi e code dove ci si muove. Il Video B (opzionale) diventa l'immagine di partenza.")
+        a, b, c = st.columns(3)
+        a.slider("Guadagno luma / Luma gain", 0.0, 3.0, step=0.05, key="rs_luma")
+        b.slider("Guadagno colore / Chroma gain", 0.0, 4.0, step=0.05, key="rs_chroma")
+        c.slider("Quantizzazione (grana) / Quantization", 0.0, 48.0, step=1.0, key="rs_quant")
+        with st.expander("Avanzati / Advanced"):
+            a4, b4, c4 = st.columns(3)
+            a4.select_slider("Blocco / Block", OPTS["rs_block"], key="rs_block")
+            a4.slider("Forza movimento / Motion strength", 0.2, 4.0, step=0.1, key="rs_strength")
+            a4.slider("Rumore MV / MV noise", 0.0, 8.0, step=0.5, key="rs_mv_noise")
+            b4.slider("RMS -> guadagno / gain", 0.0, 3.0, step=0.1, key="rs_asr")
+            b4.checkbox("Onset -> bloom", key="rs_bloom")
+            b4.checkbox("Onset forte -> azzera accumulo / refresh", key="rs_refresh")
+            b4.slider("Soglia refresh / Refresh thr", 0.5, 1.0, step=0.05, key="rs_refresh_thr")
+            c4.slider("Hold prob", 0.0, 0.5, step=0.01, key="rs_hold")
+            c4.slider("Bloom gain", 1.0, 5.0, step=0.1, key="rs_bloom_gain")
+            c4.slider("Bloom durata / length", 2, 60, key="rs_bloom_len")
+            c4.slider("Decadimento dell'errore / Decay", 0.0, 0.3, step=0.01, key="rs_decay")
+            c4.slider("Grana / Grain (coriandoli ovunque)", 0.0, 12.0, step=0.5, key="rs_grain")
+        with st.expander("Trasformazioni del moto / Motion transforms"):
+            motion_controls("mt4")
+        r1, r2, r3 = st.columns(3)
+        go4 = r1.button("GENERA RESIDUO / GENERATE", type="primary", disabled=up_a is None)
+        pv4 = r2.button("ANTEPRIMA / PREVIEW", disabled=up_a is None, key="pv4")
+        var4 = r3.button("4 VARIANTI / 4 VARIANTS", disabled=up_a is None, key="var4")
+        if (go4 or pv4) and up_a is not None:
+            finish(run_effect("RESIDUAL", pv4), pv4)
+        if var4 and up_a is not None:
+            run_variants("RESIDUAL")
 
 
-with tab5:
-    st.write("Ordina i pixel di righe o colonne dentro intervalli scelti da una soglia: colate, cascate e righe. "
-             "La soglia si allarga sui colpi. Funziona su un video (Video A) oppure su un'immagine fissa che si anima col brano "
-             "(Immagine + Audio esterno).")
-    a5, b5, c5 = st.columns(3)
-    a5.selectbox("Ordina per / Sort key", PS_KEYS, key="ps_key")
-    b5.radio("Intervalli / Intervals", PS_MODES, key="ps_imode", horizontal=True,
-             help="Soglia = in base alla luminosita'; Bordi = tra un bordo e l'altro; Casuale = tratti di lunghezza casuale.")
-    c5.slider("Angolo / Angle (0 = righe, 90 = colonne)", 0, 175, step=5, key="ps_angle")
-    a5.slider("Soglie luminosita' (min - max)", 0.0, 1.0, step=0.05, key="ps_range")
-    b5.slider("Espansione sui colpi / Audio expansion", 0.0, 0.6, step=0.05, key="ps_expand")
-    c5.selectbox("L'espansione segue", DRIVERS, key="ps_drv")
-    with st.expander("Avanzati / Advanced"):
-        a6, b6, c6 = st.columns(3)
-        a6.slider("Lunghezza max intervallo (px, 0 = libera)", 0, 400, step=10, key="ps_maxlen")
-        a6.slider("Intervalli lasciati intatti / Skip", 0.0, 0.95, step=0.05, key="ps_skip")
-        b6.checkbox("Ordine inverso / Reverse", key="ps_reverse")
-        b6.slider("Mix con l'originale", 0.0, 1.0, step=0.05, key="ps_mix")
-        c6.slider("Decadimento / Release", 0.0, 0.95, step=0.05, key="ps_release")
-        c6.select_slider("FPS (solo immagine fissa)", OPTS["ps_fps"], key="ps_fps")
-    r1, r2 = st.columns(2)
-    nodata5 = up_a is None and up_img is None
-    go5 = r1.button("GENERA PIXEL SORT / GENERATE", type="primary", disabled=nodata5)
-    pv5 = r2.button("ANTEPRIMA / PREVIEW", disabled=nodata5, key="pv5")
-    if go5 or pv5:
-        finish(run_pixelsort(pv5), pv5)
+    with tab5:
+        st.write("Ordina i pixel di righe o colonne dentro intervalli scelti da una soglia: colate, cascate e righe. "
+                 "La soglia si allarga sui colpi. Funziona su un video (Video A) oppure su un'immagine fissa che si anima col brano "
+                 "(Immagine + Audio esterno).")
+        a5, b5, c5 = st.columns(3)
+        a5.selectbox("Ordina per / Sort key", PS_KEYS, key="ps_key")
+        b5.radio("Intervalli / Intervals", PS_MODES, key="ps_imode", horizontal=True,
+                 help="Soglia = in base alla luminosita'; Bordi = tra un bordo e l'altro; Casuale = tratti di lunghezza casuale.")
+        c5.slider("Angolo / Angle (0 = righe, 90 = colonne)", 0, 175, step=5, key="ps_angle")
+        a5.slider("Soglie luminosita' (min - max)", 0.0, 1.0, step=0.05, key="ps_range")
+        b5.slider("Espansione sui colpi / Audio expansion", 0.0, 0.6, step=0.05, key="ps_expand")
+        c5.selectbox("L'espansione segue", DRIVERS, key="ps_drv")
+        with st.expander("Avanzati / Advanced"):
+            a6, b6, c6 = st.columns(3)
+            a6.slider("Lunghezza max intervallo (px, 0 = libera)", 0, 400, step=10, key="ps_maxlen")
+            a6.slider("Intervalli lasciati intatti / Skip", 0.0, 0.95, step=0.05, key="ps_skip")
+            b6.checkbox("Ordine inverso / Reverse", key="ps_reverse")
+            b6.slider("Mix con l'originale", 0.0, 1.0, step=0.05, key="ps_mix")
+            c6.slider("Decadimento / Release", 0.0, 0.95, step=0.05, key="ps_release")
+            c6.select_slider("FPS (solo immagine fissa)", OPTS["ps_fps"], key="ps_fps")
+        r1, r2, r3 = st.columns(3)
+        nodata5 = up_a is None and up_img is None
+        go5 = r1.button("GENERA PIXEL SORT / GENERATE", type="primary", disabled=nodata5)
+        pv5 = r2.button("ANTEPRIMA / PREVIEW", disabled=nodata5, key="pv5")
+        var5 = r3.button("4 VARIANTI / 4 VARIANTS", disabled=nodata5, key="var5")
+        if go5 or pv5:
+            finish(run_effect("PIXELSORT", pv5), pv5)
+        if var5:
+            run_variants("PIXELSORT")
 
 
-def dl_button(*args, **kw):
-    try:  # senza rerun dell'app (Streamlit recente)
-        return st.download_button(*args, on_click="ignore", **kw)
-    except TypeError:
-        return st.download_button(*args, **kw)
+    with tab6:
+        st.write("Concatena fino a 3 effetti: ogni passo lavora sul video del precedente, con lo stesso audio. "
+                 "Ogni effetto usa le impostazioni attuali del suo tab: regolale prima, oppure scegli un preset. "
+                 "Con un'immagine fissa il primo passo deve essere Databending o Pixel sort.")
+        ccols = st.columns(3)
+        for i, col in enumerate(ccols):
+            col.selectbox(f"Passo {i + 1}", OPTS[f"chain_{i}"], key=f"chain_{i}")
+        chain_names = [st.session_state[f"chain_{i}"] for i in range(3) if st.session_state[f"chain_{i}"] != NONE]
+        st.caption(" > ".join(chain_names) if chain_names else "Scegli almeno un effetto.")
+        if len(chain_names) >= 2 and st.session_state["max_sec"] > 60:
+            st.warning("Catena + durata oltre 60 s: il render puo' richiedere molti minuti. Prova prima con l'anteprima.")
+        r1, r2, r3 = st.columns(3)
+        nodata6 = (up_a is None and up_img is None) or not chain_names
+        go6 = r1.button("GENERA CATENA / GENERATE", type="primary", disabled=nodata6)
+        pv6 = r2.button("ANTEPRIMA / PREVIEW", disabled=nodata6, key="pv6")
+        var6 = r3.button("4 VARIANTI / 4 VARIANTS", disabled=nodata6, key="var6")
+        if go6 or pv6:
+            finish(run_effect("CHAIN", pv6), pv6)
+        if var6:
+            run_variants("CHAIN")
 
 
-def show_results():
-    r = st.session_state["dm_report"]
-    vcol, tcol = st.columns([1, 2] if r["preview"] else [3, 2])
-    vcol.video(st.session_state["dm_out"])
-    with tcol:
-        d1, d2 = st.columns(2)
-        with d1:
-            dl_button("SCARICA VIDEO / DOWNLOAD VIDEO", st.session_state["dm_out"],
-                      file_name=r["name"] + ".mp4", mime="video/mp4", key="dl_video")
-        with d2:
-            dl_button("SCARICA REPORT / DOWNLOAD REPORT", r["txt"],
-                      file_name=r["name"] + ".txt", mime="text/plain", key="dl_report")
-        st.caption(r["name"] + ".mp4  +  " + r["name"] + ".txt")
-        st.code(r["txt"], language="text")
+    def dl_button(*args, **kw):
+        try:  # senza rerun dell'app (Streamlit recente)
+            return st.download_button(*args, on_click="ignore", **kw)
+        except TypeError:
+            return st.download_button(*args, **kw)
 
 
-show_results = getattr(st, "fragment", lambda f: f)(show_results)
+    def show_results():
+        r = st.session_state["dm_report"]
+        vcol, tcol = st.columns([1, 2] if r["preview"] else [3, 2])
+        vcol.video(st.session_state["dm_out"])
+        with tcol:
+            d1, d2 = st.columns(2)
+            with d1:
+                dl_button("SCARICA VIDEO / DOWNLOAD VIDEO", st.session_state["dm_out"],
+                          file_name=r["name"] + ".mp4", mime="video/mp4", key="dl_video")
+            with d2:
+                dl_button("SCARICA REPORT / DOWNLOAD REPORT", r["txt"],
+                          file_name=r["name"] + ".txt", mime="text/plain", key="dl_report")
+            st.caption(r["name"] + ".mp4  +  " + r["name"] + ".txt")
+            st.code(r["txt"], language="text")
 
-if st.session_state["dm_out"] is not None and st.session_state["dm_report"] is not None:
-    show_results()
+
+    show_results = getattr(st, "fragment", lambda f: f)(show_results)
+
+    if st.session_state["dm_out"] is not None and st.session_state["dm_report"] is not None:
+        show_results()
+
+    show_variants()
