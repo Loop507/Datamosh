@@ -379,6 +379,7 @@ def pixelsort_video(src_video, src_image, out_path, p, progress_cb=None):
     env = driver_env(au, p["drv"], p["release"])
     start_f, end_f = int(n * p["mosh_start"] / 100), int(n * p["mosh_end"] / 100)
     done = sorted_n = 0
+    levels = []  # forza dell'effetto per fotogramma (serve all'audio)
     for t in range(n):
         if src_image:
             frame = img
@@ -388,18 +389,20 @@ def pixelsort_video(src_video, src_image, out_path, p, progress_cb=None):
                 break
             frame = fit_frame(fr, w, h)
         if start_f <= t < end_f:
-            out = pixelsort_frame(frame, p, 1.0 if env is None else at(env, t), rng)
+            lv = 1.0 if env is None else at(env, t)
+            out = pixelsort_frame(frame, p, lv, rng)
             sorted_n += 1
         else:
-            out = frame
+            out, lv = frame, 0.0
         writer.write(out)
+        levels.append(float(lv))
         done += 1
         if progress_cb and t % 5 == 0:
             progress_cb(t / max(1, n - 1))
     writer.release()
     if cap is not None:
         cap.release()
-    return fps, {"frames": done, "sorted": sorted_n, "source": "image" if src_image else "video"}
+    return fps, {"frames": done, "sorted": sorted_n, "source": "image" if src_image else "video", "env": levels}
 
 
 def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
@@ -445,7 +448,7 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
     mosh = first.copy().astype(np.float32)
     writer.write(first)
 
-    stats = {"frames": 1, "iframes": 1, "holds": 0, "blooms": 0}
+    stats = {"frames": 1, "iframes": 1, "holds": 0, "blooms": 0, "ev": [0]}
     bloom_flow, bloom_left, b_loaded = None, 0, False
 
     for t in range(1, n_max):
@@ -455,12 +458,14 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
         frame = fit_frame(frame, w, h)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         in_window = start_f <= t < end_f
+        code = 0  # evento del fotogramma per l'audio: 0 reale, 1 mosh, 2 hold, 3/4 bloom, 5 I-frame
 
         if not in_window:
             # fuori dalla finestra: video reale, e il mosh riparte dall'ultimo frame reale
             mosh = frame.astype(np.float32)
             out = frame
         else:
+            code = 1
             # entrando nella finestra: se c'e' B, la texture di partenza e' B
             if cap_b is not None and not b_loaded:
                 okb, fb = cap_b.read()
@@ -475,6 +480,7 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
             if refresh:
                 mosh = frame.astype(np.float32)
                 stats["iframes"] += 1
+                code = 5
                 bloom_left = 0
 
             # flow del frame
@@ -489,15 +495,18 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
             if rng.random() < p["hold_prob"]:
                 flow = np.zeros_like(flow)
                 stats["holds"] += 1
+                code = 2
 
             # bloom: ripete lo stesso flow per k frame
             if bloom_left > 0 and bloom_flow is not None:
                 flow = bloom_flow
                 bloom_left -= 1
+                code = 4
             elif (au and p["a_bloom"] and at(au["trig_bloom"], t) > p["onset_thr"]) or rng.random() < p["bloom_prob"]:
                 bloom_flow = flow.copy() * p["bloom_gain"]
                 bloom_left = int(rng.integers(p["bloom_len"][0], p["bloom_len"][1] + 1))
                 stats["blooms"] += 1
+                code = 3
 
             if mt:
                 flow = transform_flow(flow, mt, 1.0 if zenv is None else at(zenv, t), fs, rng,
@@ -516,6 +525,7 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
             out = np.clip(mosh, 0, 255).astype(np.uint8)
 
         writer.write(out)
+        stats["ev"].append(code)
         prev_gray = gray
         stats["frames"] += 1
         if progress_cb and t % 5 == 0:
@@ -561,7 +571,7 @@ def residual_video(src_a, src_b, out_path, p, progress_cb=None):
     mt, fs = p.get("mt"), {}
     zenv = driver_env(au, mt["zoom_drv"], 0.8) if (mt and au) else None
     step = float(p["res_quant"])
-    stt = {"frames": 1, "iframes": 0, "holds": 0, "blooms": 0}
+    stt = {"frames": 1, "iframes": 0, "holds": 0, "blooms": 0, "ev": [0]}
     bloom_flow, bloom_left, b_loaded = None, 0, False
     for t in range(1, n_max):
         ok, fr = cap.read()
@@ -569,9 +579,11 @@ def residual_video(src_a, src_b, out_path, p, progress_cb=None):
             break
         frame = fit_frame(fr, w, h)
         gray, cur_f = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), ycc(frame)
+        code = 0  # evento del fotogramma per l'audio: 0 reale, 1 mosh, 2 hold, 3/4 bloom, 5 I-frame
         if not (start_f <= t < end_f):
             out_f, out = cur_f.copy(), frame
         else:
+            code = 1
             if cap_b is not None and not b_loaded:
                 okb, fb = cap_b.read()
                 if okb:
@@ -581,6 +593,7 @@ def residual_video(src_a, src_b, out_path, p, progress_cb=None):
                 out_f = cur_f.copy()  # "I-frame": azzera l'accumulo
                 bloom_left = 0
                 stt["iframes"] += 1
+                code = 5
             k_str = p["strength"] * (1.0 + p["a_strength"] * at(au["rms"], t) if au else 1.0)
             raw = compute_flow(prev_gray, gray, dis)
             true = to_block_mv(raw, p["block"], rng, 0.0)  # moto "vero" a macroblocchi
@@ -589,13 +602,16 @@ def residual_video(src_a, src_b, out_path, p, progress_cb=None):
             if rng.random() < p["hold_prob"]:
                 mflow = np.zeros_like(mflow)
                 stt["holds"] += 1
+                code = 2
             if bloom_left > 0 and bloom_flow is not None:
                 mflow, bloom_left = bloom_flow, bloom_left - 1
+                code = 4
             elif (au and p["a_bloom"] and at(au["trig_bloom"], t) > p["onset_thr"]) or \
                     rng.random() < p["bloom_prob"]:
                 bloom_flow = mflow * p["bloom_gain"]
                 bloom_left = int(rng.integers(p["bloom_len"][0], p["bloom_len"][1] + 1))
                 stt["blooms"] += 1
+                code = 3
             if mt:
                 mflow = transform_flow(mflow, mt, 1.0 if zenv is None else at(zenv, t), fs, rng,
                                        gx, gy, p["block"])
@@ -614,6 +630,7 @@ def residual_video(src_a, src_b, out_path, p, progress_cb=None):
                     out_f = out_f * mk[..., None] + cur_f * (1.0 - mk[..., None])
             out = cv2.cvtColor(out_f.astype(np.uint8), cv2.COLOR_YCrCb2BGR)
         writer.write(out)
+        stt["ev"].append(code)
         prev_gray, prev_f = gray, cur_f
         stt["frames"] += 1
         if progress_cb and t % 5 == 0:
@@ -698,12 +715,8 @@ def decode_pcm(path, sr, max_sec):
     return a if len(a) else None
 
 
-def mosh_audio(audio_src, out_wav, smap, fps, max_sec, amount=1.0, sr=44100, fade_ms=3):
-    """L'audio segue il mosh: ogni slot ripete o salta la stessa fettina di suono del fotogramma mostrato.
-    Dove il video si congela l'audio si ripete, dove salta salta anche lui. Dissolvenze brevi tolgono i clic."""
-    a = decode_pcm(audio_src, sr, max_sec)
-    if a is None or not smap:
-        return None
+def slice_audio(a, smap, fps, sr, fade_ms=3):
+    """Ogni slot ripete o salta la fettina di suono del fotogramma mostrato; dove e' continuo non c'e' nessun taglio."""
     n, spf = len(smap), sr / float(fps)
     total = int(round(n * spf))
 
@@ -725,7 +738,101 @@ def mosh_audio(audio_src, out_wav, smap, fps, max_sec, amount=1.0, sr=44100, fad
             out[lo - fade:lo] *= ramp[::-1]
             out[lo:lo + fade] *= ramp
         prev, src_pos = sf, start + (hi - lo)
-    mixed = np.clip((1.0 - amount) * a[:total] + amount * out, -1.0, 1.0)
+    return out, a[:total]
+
+
+def bend_audio(a, amt, delay_s, sr, rng):
+    """Gli effetti del databending applicati al suono (a: float32 (n, 2)): stessi nomi, stesse quantita'."""
+    a = np.array(a, np.float32)  # copia: burn e invert scrivono sul posto e non devono toccare il flusso originale
+    n = len(a)
+
+    def g(k):
+        return float(amt.get(k, 0.0))
+
+    def band(frac):
+        h = max(2, int(n * frac))
+        y0 = int(rng.integers(0, max(1, n - h)))
+        return y0, min(n, y0 + h)
+
+    if g("slip") > 0.03:  # cancella campioni: tutto il resto scivola
+        k = int(g("slip") * 400) + 1
+        for _ in range(1 + int(2 * g("slip"))):
+            pos = int(rng.integers(0, max(1, n - k)))
+            a = np.concatenate([a[:pos], a[pos + k:], np.zeros((k, 2), np.float32)])
+    if g("echo") > 0.03:
+        gain, d = 0.85 * g("echo"), max(8, int(delay_s * sr))
+        y, norm = a.copy(), 1.0
+        for k in (1, 2, 3):
+            sh = k * d
+            if sh < n:
+                y[sh:] += (gain ** k) * a[:-sh]
+                norm += gain ** k
+        a = y / norm
+    if g("reverb") > 0.03:
+        al = 1.0 - 10.0 ** (-(0.3 + 2.4 * g("reverb")))
+        wet = lfilter([1 - al], [1, -al], a, axis=0).astype(np.float32)
+        wet = np.where(np.abs(wet) > np.abs(a), wet, a)
+        a = a * (1 - g("reverb")) + wet * g("reverb")
+    if g("hp") > 0.03:
+        low = lfilter([0.1], [1, -0.9], a, axis=0).astype(np.float32)
+        a = a * (1 - g("hp")) + (a - low) * 2 * g("hp")
+    if g("dist") > 0.03:
+        drive = 1 + 14 * g("dist")
+        a = np.tanh(drive * a) / np.tanh(drive)
+    if g("burn") > 0.03:
+        gain = 1 + 7 * g("burn")
+        for _ in range(1 + int(3 * g("burn"))):
+            s0, s1 = band(0.05 + 0.25 * g("burn"))
+            a[s0:s1] = np.clip(a[s0:s1] * np.linspace(1, gain, s1 - s0, dtype=np.float32)[:, None], -1, 1)
+    if g("invert") > 0.05:  # nel suono la polarita' non si sente: la fascia viene letta al contrario
+        for _ in range(1 + int(3 * g("invert"))):
+            s0, s1 = band(0.04 + 0.2 * g("invert"))
+            a[s0:s1] = a[s0:s1][::-1].copy()
+    if g("crush") > 0.03:
+        lv = 2 + int(30 * (1 - g("crush")))
+        a = np.round(a * lv) / lv
+        if g("crush") > 0.3:
+            k = 3 * (1 + int(g("crush") * 10))
+            a = np.repeat(a[::k], k, axis=0)[:n]
+    return np.clip(a, -1.0, 1.0).astype(np.float32)
+
+
+def apply_bend(x, amts, fps, sr, rng, delay_s, edge_ms=3):
+    """Applica bend_audio a ogni slot con le quantita' di quel fotogramma; i raccordi sono dissolvenze complementari."""
+    spf, f = sr / float(fps), max(1, int(sr * edge_ms / 1000))
+    total, ctx = len(x), int(sr / float(fps) * 0.5)
+    acc, wsum = np.zeros_like(x), np.zeros(total, np.float32)
+
+    def b(i):
+        return int(round(i * spf))
+
+    for k, am in enumerate(amts):
+        if not am or max(am.values()) <= 0.03:
+            continue
+        s0, s1 = max(0, b(k) - f), min(total, b(k + 1) + f)
+        if s1 - s0 < 4 * f:
+            continue
+        cs, ce = max(0, s0 - ctx), min(total, s1 + ctx)
+        seg = bend_audio(x[cs:ce], am, delay_s, sr, rng)[s0 - cs:s1 - cs]
+        w = np.ones(s1 - s0, np.float32)
+        w[:2 * f] = np.linspace(0.0, 1.0, 2 * f, dtype=np.float32)
+        w[-2 * f:] = np.minimum(w[-2 * f:], np.linspace(1.0, 0.0, 2 * f, dtype=np.float32))
+        acc[s0:s1] += seg * w[:, None]
+        wsum[s0:s1] += w
+    wsum = np.minimum(wsum, 1.0)
+    return acc + x * (1.0 - wsum)[:, None]
+
+
+def destroy_audio(audio_src, out_wav, smap, amts, fps, max_sec, amount=1.0, sr=44100, delay_s=0.04, seed=507):
+    """Audio rovinato come il video: riordino delle fettine (smap) + effetti per fotogramma (amts)."""
+    a = decode_pcm(audio_src, sr, max_sec)
+    if a is None or not (smap or amts):
+        return None
+    smap = list(smap) if smap else list(range(len(amts)))
+    moshed, orig = slice_audio(a, smap, fps, sr)
+    if amts:
+        moshed = apply_bend(moshed, amts, fps, sr, np.random.default_rng(int(seed)), delay_s)
+    mixed = np.clip((1.0 - amount) * orig + amount * moshed, -1.0, 1.0)
     with wave.open(out_wav, "wb") as w:
         w.setnchannels(2)
         w.setsampwidth(2)
@@ -734,29 +841,87 @@ def mosh_audio(audio_src, out_wav, smap, fps, max_sec, amount=1.0, sr=44100, fad
     return out_wav
 
 
-def compose_smap(kind, stt):
-    """Mappa dei fotogrammi del motore Byte (anche piu' Byte in catena); None se l'effetto non riordina i fotogrammi."""
-    steps = stt["steps"] if kind == "CHAIN" else [(kind, None, stt)]
-    m = None
-    for k, _p, s in steps:
-        sm = s.get("smap") if k == "BYTE" else None
+def mosh_audio(audio_src, out_wav, smap, fps, max_sec, amount=1.0, sr=44100, fade_ms=3):
+    """Solo il riordino delle fettine (motore Byte)."""
+    return destroy_audio(audio_src, out_wav, smap, None, fps, max_sec, amount, sr)
+
+
+STRONG = {"crush": 0.6, "dist": 0.5, "echo": 0.35, "slip": 0.3, "burn": 0.2}
+
+
+def audio_plan(kind, p, stt):
+    """Cosa fa l'effetto fotogramma per fotogramma, tradotto per il suono: (mappa dei fotogrammi, effetti per slot)."""
+    if kind == "BYTE":
+        return stt.get("smap"), None
+    if kind == "DATABEND":
+        return None, [dict(a) for a in stt.get("amts", [])]
+    if kind == "PIXELSORT":
+        m = float(p.get("mix", 1.0))
+        return None, [{} if e <= 0 else {"reverb": 0.8 * e * m, "echo": 0.5 * e * m, "slip": 0.5 * e * m,
+                                          "crush": 0.45 * e * m, "dist": 0.3 * e * m}
+                      for e in stt.get("env", [])]
+    ev = stt.get("ev")
+    if not ev:
+        return None, None
+    keep = 1.0 - float(p.get("residual", 0.0))  # il residuo fa trapelare il reale: anche l'audio
+    gain = min(1.0, float(p.get("bloom_gain", 2.5)) / 3.0)
+    base = {"crush": 0.12 + 0.3 * min(1.0, float(p.get("res_quant", 0.0)) / 24.0), "dist": 0.15, "slip": 0.08}
+    smap, amts, last_s, loop0 = [], [], 0, 0
+    for t, code in enumerate(ev):
+        if code in (0, 5):  # video reale o I-frame: l'audio e' pulito
+            s, a = t, {}
+        elif code == 1:
+            s, a = t, {k: v * keep for k, v in base.items()}
+        elif code == 2:  # hold: l'immagine si congela, il suono si ripete
+            s, a = last_s, {"crush": 0.5 * keep, "dist": 0.25 * keep}
+        else:  # bloom: lo stesso movimento si ripete, e il suono gira in un anello di 3 fotogrammi
+            if code == 3:
+                loop0 = t
+            s = loop0 + ((t - loop0) % 3)
+            a = {k: v * gain * keep for k, v in STRONG.items()}
+        smap.append(s)
+        amts.append(a)
+        last_s = s
+    return smap, amts
+
+
+def audio_plans(kind, stt):
+    """Unisce i piani di tutti i passi (anche di una catena): mappe composte in ordine, effetti sommati."""
+    steps = stt["steps"] if kind == "CHAIN" else [(kind, stt.get("p") or {}, stt)]
+    smap, amts = None, None
+    for k, p, s in steps:
+        sm, am = audio_plan(k, p, s)
         if sm:
-            m = list(sm) if m is None else [m[min(int(i), len(m) - 1)] for i in sm]
-    return m
+            smap = list(sm) if smap is None else [smap[min(int(i), len(smap) - 1)] for i in sm]
+        if am:
+            if amts is None:
+                amts = [dict(a) for a in am]
+            else:
+                for i, a in enumerate(am):
+                    if i >= len(amts):
+                        amts.append({})
+                    for fx, v in a.items():
+                        amts[i][fx] = min(1.0, amts[i].get(fx, 0.0) + v)
+    return smap, amts
 
 
-def audio_with_mosh(kind, ss, audio_src, stt, fps, max_sec, tmp):
-    """Se l'opzione e' attiva e c'e' un Byte, ritorna l'audio che segue il mosh (altrimenti l'audio originale)."""
+def audio_with_mosh(kind, ss, audio_src, stt, fps, max_sec, tmp, p=None):
+    """Se l'opzione e' attiva, ritorna l'audio rovinato come l'effetto (altrimenti l'audio originale)."""
     amt = float(ss["audio_mosh_amt"])
     if not (ss["keep_audio"] and ss["audio_mosh"]) or amt <= 0:
         return audio_src
-    smap = compose_smap(kind, stt)
-    out = mosh_audio(audio_src, os.path.join(tmp, "audio_mosh.wav"), smap, fps, max_sec, amt) if smap else None
+    st1 = stt if kind == "CHAIN" else dict(stt, p=p or {})
+    smap, amts = audio_plans(kind, st1)
+    if not (smap or amts):
+        return audio_src
+    steps = stt["steps"] if kind == "CHAIN" else [(kind, p or {}, stt)]
+    dl = next((float(q.get("delay", 0.37)) for k, q, _s in steps if k == "DATABEND"), 0.37)
+    out = destroy_audio(audio_src, os.path.join(tmp, "audio_mosh.wav"), smap, amts, fps, max_sec, amt,
+                        delay_s=max(0.008, min(0.18, dl * 0.12)), seed=int((steps[0][1] or {}).get("seed", 507)))
     if not out:
         return audio_src
-    for k, _p, s in (stt["steps"] if kind == "CHAIN" else [(kind, None, stt)]):
-        if k == "BYTE":
-            s["audio_mosh"] = amt
+    for _k, _q, s0 in steps:
+        s0["audio_mosh"] = amt
     return out
 
 
@@ -1043,6 +1208,7 @@ def databend_video(src_video, src_image, out_path, p, progress_cb=None):
     env = {k: driver_env(au, p["db_drv"][k], p["release"]) for k in FX}
     start_f, end_f = int(n * p["mosh_start"] / 100), int(n * p["mosh_end"] / 100)
     prev, bent, done = None, 0, 0
+    amts = []  # quantita' degli effetti per fotogramma (servono all'audio)
     for t in range(n):
         if src_image:
             frame = img
@@ -1057,8 +1223,10 @@ def databend_video(src_video, src_image, out_path, p, progress_cb=None):
                 cv2.addWeighted(frame, 1 - p["mem"], prev, p["mem"], 0)
             out = bend_scan(base, amt, p, rng)
             prev, bent = out, bent + 1
+            amts.append(dict(amt))
         else:
             out, prev = frame, None
+            amts.append({})
         writer.write(out)
         done += 1
         if progress_cb and t % 5 == 0:
@@ -1067,7 +1235,7 @@ def databend_video(src_video, src_image, out_path, p, progress_cb=None):
     if cap is not None:
         cap.release()
     return fps, {"frames": done, "bent": bent, "source": "image" if src_image else "video",
-                 "fx": dict(p["db_fx"]), "scan": p["scan"], "space": p["space"]}
+                 "fx": dict(p["db_fx"]), "scan": p["scan"], "space": p["space"], "amts": amts}
 
 # ============================================================================
 # PARAMETRI E PRESET (nessuna interfaccia)
@@ -1622,8 +1790,7 @@ def step_rows(kind, p, stt, it):
     eng = str(p.get("flow_engine", "")).split(" ")[0]
     if kind == "BYTE":
         rows = [("Dropped I", stt["dropped_i"]), ("Dups", stt["dups"]), ("Skips", stt["skips"]),
-                ("Corrupt", stt["corrupt"]), ("Keyframe Audio", stt["kf_audio"]), ("Transfer", yn(stt["transfer"])),
-                ("Audio Mosh" if not it else "Audio mosh", f"{stt['audio_mosh']:.2f}" if stt.get("audio_mosh") else "No")]
+                ("Corrupt", stt["corrupt"]), ("Keyframe Audio", stt["kf_audio"]), ("Transfer", yn(stt["transfer"]))]
         dsp = "AVI/MPEG-4 byte-level + librosa"
     elif kind == "OPTICAL":
         rows = [("Modo" if it else "Mode", p["mode"]), ("Motore flow" if it else "Flow engine", eng),
@@ -1666,6 +1833,7 @@ def step_rows(kind, p, stt, it):
         rows.append(("Decadimento" if it else "Decay", p["decay"]))
     if kind == "RESIDUAL" and p.get("grain", 0) > 0:
         rows.append(("Grana" if it else "Grain", p["grain"]))
+    rows.append(("Audio rovinato" if it else "Audio destroyed", f"{stt['audio_mosh']:.2f}" if stt.get("audio_mosh") else "No"))
     return rows, dsp
 
 
@@ -1833,9 +2001,9 @@ if _in_streamlit():
             st.caption("Oltre 60 s il render puo' richiedere diversi minuti: prova prima con l'anteprima.")
         prev_sec = st.slider("Secondi anteprima / Preview seconds", 2, 6, key="prev_sec")
         keep_audio = st.checkbox("Mantieni audio (A o esterno) / Keep audio", key="keep_audio")
-        audio_mosh = st.checkbox("L'audio segue il mosh (Byte) / Audio follows the mosh", key="audio_mosh",
+        audio_mosh = st.checkbox("L'audio viene rovinato come l'effetto / Audio destroyed like the effect", key="audio_mosh",
                                  disabled=not keep_audio,
-                                 help="Dove l'immagine si congela l'audio si ripete, dove salta salta anche lui. Vale per il motore Byte e per le catene che lo contengono.")
+                                 help="Byte: dove l'immagine si congela o salta, si ripete o salta anche il suono. Optical e Residuo: stutter e bitcrush su hold e bloom. Databending: gli stessi effetti (eco, riverbero, bitcrush, distorsione...) con gli stessi pilotaggi. Pixel sort: smear e crush sulla forza dell'effetto. Vale anche per le catene.")
         audio_mosh_amt = st.slider("Quantita' audio rovinato / Audio mosh amount", 0.0, 1.0, step=0.05,
                                    key="audio_mosh_amt", disabled=not (keep_audio and audio_mosh))
         trigger = st.radio("Trigger audio", OPTS["trigger"], key="trigger",
@@ -1952,7 +2120,7 @@ if _in_streamlit():
         p["au"] = au
         raw = os.path.join(tmp, "raw." + ("avi" if kind == "BYTE" else "mp4"))
         fps, stt = run_engine(kind, p, video, src["image"], src["b"], raw, cb)
-        audio = audio_with_mosh(kind, ss, src["audio"], stt, fps, msec, tmp)
+        audio = audio_with_mosh(kind, ss, src["audio"], stt, fps, msec, tmp, p)
         finalize_h264(raw, audio, final, ss["keep_audio"], msec)
         return final, kind, p, fps, stt
 
