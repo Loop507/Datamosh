@@ -19,6 +19,7 @@ import re
 import struct
 import subprocess
 import tempfile
+import wave
 
 from scipy.signal import lfilter
 import cv2
@@ -688,6 +689,77 @@ def finalize_h264(raw_path, audio_src, final_path, keep_audio, max_sec):
     subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
+def decode_pcm(path, sr, max_sec):
+    """Audio della sorgente come float32 stereo (n, 2), oppure None se non c'e' una traccia audio."""
+    r = subprocess.run([FFMPEG, "-v", "error", "-t", str(max_sec), "-i", path, "-vn", "-ac", "2", "-ar", str(sr),
+                        "-f", "f32le", "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    a = np.frombuffer(r.stdout, np.float32)
+    a = a[:a.size // 2 * 2].reshape(-1, 2).copy()
+    return a if len(a) else None
+
+
+def mosh_audio(audio_src, out_wav, smap, fps, max_sec, amount=1.0, sr=44100, fade_ms=3):
+    """L'audio segue il mosh: ogni slot ripete o salta la stessa fettina di suono del fotogramma mostrato.
+    Dove il video si congela l'audio si ripete, dove salta salta anche lui. Dissolvenze brevi tolgono i clic."""
+    a = decode_pcm(audio_src, sr, max_sec)
+    if a is None or not smap:
+        return None
+    n, spf = len(smap), sr / float(fps)
+    total = int(round(n * spf))
+
+    def b(i):
+        return int(round(i * spf))
+
+    a = np.vstack([a, np.zeros((max(0, total + 4 - len(a)), 2), np.float32)])
+    out, fade = np.zeros((total, 2), np.float32), max(1, int(sr * fade_ms / 1000))
+    ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)[:, None]
+    prev, src_pos = None, 0
+    for k, sf in enumerate(smap):
+        lo, hi = b(k), b(k + 1)
+        sf = int(sf)
+        joined = prev is not None and sf == prev + 1  # continuo: niente salto, niente dissolvenza
+        start = src_pos if joined else b(sf)
+        chunk = a[start:start + (hi - lo)]
+        out[lo:lo + len(chunk)] = chunk
+        if not joined and prev is not None and hi - lo > 2 * fade:
+            out[lo - fade:lo] *= ramp[::-1]
+            out[lo:lo + fade] *= ramp
+        prev, src_pos = sf, start + (hi - lo)
+    mixed = np.clip((1.0 - amount) * a[:total] + amount * out, -1.0, 1.0)
+    with wave.open(out_wav, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes((mixed * 32767).astype(np.int16).tobytes())
+    return out_wav
+
+
+def compose_smap(kind, stt):
+    """Mappa dei fotogrammi del motore Byte (anche piu' Byte in catena); None se l'effetto non riordina i fotogrammi."""
+    steps = stt["steps"] if kind == "CHAIN" else [(kind, None, stt)]
+    m = None
+    for k, _p, s in steps:
+        sm = s.get("smap") if k == "BYTE" else None
+        if sm:
+            m = list(sm) if m is None else [m[min(int(i), len(m) - 1)] for i in sm]
+    return m
+
+
+def audio_with_mosh(kind, ss, audio_src, stt, fps, max_sec, tmp):
+    """Se l'opzione e' attiva e c'e' un Byte, ritorna l'audio che segue il mosh (altrimenti l'audio originale)."""
+    amt = float(ss["audio_mosh_amt"])
+    if not (ss["keep_audio"] and ss["audio_mosh"]) or amt <= 0:
+        return audio_src
+    smap = compose_smap(kind, stt)
+    out = mosh_audio(audio_src, os.path.join(tmp, "audio_mosh.wav"), smap, fps, max_sec, amt) if smap else None
+    if not out:
+        return audio_src
+    for k, _p, s in (stt["steps"] if kind == "CHAIN" else [(kind, None, stt)]):
+        if k == "BYTE":
+            s["audio_mosh"] = amt
+    return out
+
+
 def vop_type(b):
     i = b.find(b"\x00\x00\x01\xb6")
     return -1 if i < 0 or i + 4 >= len(b) else b[i + 4] >> 6  # 0=I 1=P 2=B
@@ -751,31 +823,33 @@ def byte_mosh(frames, au, p, rng):
     types = [vop_type(f) for f in frames]
     start_f, end_f = int(n * p["mosh_start"] / 100), int(n * p["mosh_end"] / 100)
     out, s, hold, last, last_t = [], 0, 0, None, 0
+    smap, last_s = [], 0  # smap[k] = fotogramma sorgente mostrato nello slot k (serve all'audio)
     st = {"frames": 0, "dropped_i": 0, "dups": 0, "skips": 0, "corrupt": 0}
     for k in range(n):
         dr, bl, en = at(au["trig_drop"], k), at(au["trig_bloom"], k), at(au["rms"], k)
         win = start_f <= k < end_f and k > 0
         if hold > 0 and last is not None:
-            out.append(last); hold -= 1; st["dups"] += 1; continue
-        s = min(s, n - 1)
+            out.append(last); smap.append(last_s); hold -= 1; st["dups"] += 1; continue
+        s = min(max(s, k - p.get("max_lag", 8)), n - 1)  # resincronia: l'immagine non resta mai troppo indietro rispetto all'audio
         if win:
             if types[s] == 0 and s != p["protect"] and (p["drop_mode"] == "Tutti" or
                     (p["drop_mode"] == "Su onset" and (dr > p["drop_thr"] or s in p["kf_set"]))):
                 s = min(s + 1, n - 1); st["dropped_i"] += 1
             if last is not None and last_t != 0 and (bl > p["onset_thr"] or rng.random() < p["bloom_prob"]):
-                hold = int(max(bl, 0.3) * p["max_dup"]); out.append(last); st["dups"] += 1; continue
+                hold = int(max(bl, 0.3) * p["max_dup"]); out.append(last); smap.append(last_s); st["dups"] += 1; continue
             if en < p["quiet_thr"] and last is not None and last_t != 0:
                 if k - s > 0:
                     s = min(s + 1, n - 1); st["skips"] += 1
                 elif k - s < 0:
-                    out.append(last); st["dups"] += 1; continue
+                    out.append(last); smap.append(last_s); st["dups"] += 1; continue
         f, t = frames[s], types[s]
         if win and t != 0:
             nb = int(len(f) * p["corrupt"] * at(au["corr"], k))
             if nb > 0:
                 f = corrupt_bytes(f, nb, rng); st["corrupt"] += nb
-        out.append(f); last, last_t = f, t; s += 1
+        out.append(f); smap.append(s); last, last_t, last_s = f, t, s; s += 1
     st["frames"] = len(out)
+    st["smap"] = smap
     return out, st
 
 
@@ -814,6 +888,7 @@ def byte_datamosh(src, src_b, out_avi, p):
     # keyframe forzati sui picchi dell'audio: ogni colpo ha un I-frame da togliere
     kfi = audio_keyframes(au["trig_drop"][:n_est], p["drop_thr"]) if p.get("kf_on_audio") else []
     p["kf_set"], p["protect"] = set(kfi), -1
+    p["max_lag"] = max(2, int(round(fps * 0.3)))  # ritardo massimo dell'immagine sull'audio: 0,3 secondi
     tmp = tempfile.mkdtemp()
     path_a = os.path.join(tmp, "a.avi")
     transcode_avi(src, path_a, w, h, fps, p, [k / fps for k in kfi])
@@ -1002,7 +1077,7 @@ ACC = {"4/4": 4, "3/4": 3, "6/8": 6, "2/4": 2}
 
 DEFAULTS = {
     "seed": 507, "mosh_range": (15, 100), "max_w": 640, "max_sec": 30, "prev_sec": 3,
-    "keep_audio": True, "onset_thr": 0.6, "bloom_prob": 0.02, "trigger": "Onset",
+    "keep_audio": True, "audio_mosh": False, "audio_mosh_amt": 1.0, "onset_thr": 0.6, "bloom_prob": 0.02, "trigger": "Onset",
     "bands": False, "bpm_manual": 0.0, "meter": "4/4", "beat_offset": 0, "downbeat": 1, "show_wave": False, "fmt": "Originale", "fit": "Ritaglia", "flow_engine": "DIS (veloce)",
     "kf": 12, "qscale": 5, "kf_on_audio": True, "drop_mode": "Su onset", "drop_thr": 0.5,
     "max_dup": 12, "corrupt": 0.002, "quiet_thr": 0.25,
@@ -1026,7 +1101,7 @@ DEFAULTS = {
 for _p in ("mt2", "mt4"):  # trasformazioni del moto: stesse impostazioni, una copia per tab
     DEFAULTS.update({f"{_p}_{_k}": _v for _k, _v in MT_DEFAULTS.items()})
 
-KEEP = ("fmt", "fit", "beat_offset", "downbeat", "show_wave", "seed", "max_w", "max_sec", "prev_sec", "keep_audio", "bpm_manual", "meter", "flow_engine")
+KEEP = ("fmt", "fit", "beat_offset", "downbeat", "show_wave", "seed", "max_w", "max_sec", "prev_sec", "keep_audio", "audio_mosh", "audio_mosh_amt", "bpm_manual", "meter", "flow_engine")
 
 OPTS = {"trigger": ["Onset", "Beat (a tempo)", "Onset + Beat"], "drop_mode": ["Su onset", "Tutti", "Mai"],
         "mode": ["Block MV", "Optical Flow"], "rs_block": [8, 16, 32, 64], "block": [8, 16, 32, 64], "meter": list(ACC),
@@ -1035,7 +1110,7 @@ OPTS = {"trigger": ["Onset", "Beat (a tempo)", "Onset + Beat"], "drop_mode": ["S
         "db_space": ["BGR", "YCrCb"], "db_tile": [16, 32, 64],
         **{"db_d_" + k: DRIVERS for k in FX}}
 
-LIM = {"seed": (0, 2**31 - 1), "mosh_range": (0, 100), "max_sec": (2, 180), "prev_sec": (2, 6),
+LIM = {"seed": (0, 2**31 - 1), "audio_mosh_amt": (0.0, 1.0), "mosh_range": (0, 100), "max_sec": (2, 180), "prev_sec": (2, 6),
        "onset_thr": (0.1, 1.0), "bloom_prob": (0.0, 0.3), "bpm_manual": (0.0, 300.0), "beat_offset": (-300, 300), "downbeat": (1, 6),
        "kf": (6, 120), "qscale": (2, 15), "drop_thr": (0.1, 1.0), "max_dup": (1, 40),
        "corrupt": (0.0, 0.01), "quiet_thr": (0.0, 0.6), "strength": (0.2, 4.0), "mv_noise": (0.0, 8.0),
@@ -1272,6 +1347,53 @@ def valid(k, v):
     return isinstance(v, num) and not isinstance(v, bool) and lo <= v <= hi
 
 
+
+VAR_PREFIX = {"BYTE": ("kf", "qscale", "drop_mode", "drop_thr", "max_dup", "corrupt", "quiet_thr", "kf_on_audio"),
+              "OPTICAL": ("mode", "block", "strength", "mv_noise", "hold_prob", "bloom_gain", "bloom_len", "residual",
+                          "a_strength", "a_bloom", "a_refresh", "refresh_thr", "mt2_"),
+              "RESIDUAL": ("rs_", "mt4_"), "DATABEND": ("db_",), "PIXELSORT": ("ps_",)}
+VAR_COMMON = ("mosh_range", "onset_thr", "bloom_prob", "trigger")
+VAR_SKIP = ("db_fps", "ps_fps", "db_tile")
+
+
+def variant_keys(kind):
+    """Controlli che le varianti possono cambiare per un effetto (la catena usa quelli dei passi scelti)."""
+    kinds = list(VAR_PREFIX) if kind == "CHAIN" else [kind]
+    pre = tuple(x for k in kinds for x in VAR_PREFIX[k])
+    keys = [k for k in DEFAULTS if k not in KEEP and k not in VAR_SKIP and
+            (k in VAR_COMMON or any(k == x or (x.endswith("_") and k.startswith(x)) for x in pre))]
+    return [k for k in keys if k in LIM or k in OPTS or isinstance(DEFAULTS[k], bool)]
+
+
+def vary_params(base, kind, rng, amount=0.75):
+    """Una variante vera: sposta i controlli verso valori casuali (amount 0 = uguale, 1 = a caso nei limiti)."""
+    out = dict(base)
+    for k in variant_keys(kind):
+        v = base[k]
+        if k in OPTS:
+            if rng.random() < 0.5 * amount + 0.15:
+                out[k] = rng.choice(OPTS[k])
+        elif isinstance(DEFAULTS[k], bool):
+            if rng.random() < 0.35 * amount + 0.1:
+                out[k] = not v
+        else:
+            lo, hi = LIM[k]
+            is_int = isinstance(lo, int) and isinstance(hi, int) and not isinstance(DEFAULTS[k], float)
+
+            def pick(x):
+                t = rng.uniform(lo, hi)
+                r = x + (t - x) * amount
+                return int(round(r)) if is_int else float(r)
+
+            if isinstance(DEFAULTS[k], tuple):
+                a, b = sorted((pick(v[0]), pick(v[1])))
+                out[k] = (a, b)
+            else:
+                out[k] = pick(v)
+        if not valid(k, out[k]):
+            out[k] = base[k]
+    return out
+
 # ----------------------------------------------------------------------------
 # CATENA DI EFFETTI + COSTRUZIONE DEI PARAMETRI
 # ----------------------------------------------------------------------------
@@ -1485,10 +1607,10 @@ def mt_desc(mt, it):
 
 TAGS = {  # (hashtag centrali, tag YouTube centrale, hashtag finali, tag YouTube finali)
     "BYTE": (["byte"], ["byte"], ["mpeg4", "avi"], ["mpeg-4", "avi"]),
-    "OPTICAL": (["opticalflow"], ["optical flow"], ["opencv", "motionvectors"], ["opencv", "motion vectors"]),
+    "OPTICAL": (["opticalflow"], ["optical flow"], ["motionvectors"], ["motion vectors"]),
     "DATABEND": (["databending"], ["databending"], ["numpy", "scipy"], ["numpy", "scipy"]),
-    "RESIDUAL": (["residualmosh"], ["residual mosh"], ["opencv", "pframe"], ["opencv", "p-frame"]),
-    "PIXELSORT": (["pixelsorting"], ["pixel sorting"], ["numpy", "opencv"], ["numpy", "opencv"]),
+    "RESIDUAL": (["residualmosh"], ["residual mosh"], ["pframe"], ["p-frame"]),
+    "PIXELSORT": (["pixelsorting"], ["pixel sorting"], ["numpy"], ["numpy"]),
 }
 
 
@@ -1500,7 +1622,8 @@ def step_rows(kind, p, stt, it):
     eng = str(p.get("flow_engine", "")).split(" ")[0]
     if kind == "BYTE":
         rows = [("Dropped I", stt["dropped_i"]), ("Dups", stt["dups"]), ("Skips", stt["skips"]),
-                ("Corrupt", stt["corrupt"]), ("Keyframe Audio", stt["kf_audio"]), ("Transfer", yn(stt["transfer"]))]
+                ("Corrupt", stt["corrupt"]), ("Keyframe Audio", stt["kf_audio"]), ("Transfer", yn(stt["transfer"])),
+                ("Audio Mosh" if not it else "Audio mosh", f"{stt['audio_mosh']:.2f}" if stt.get("audio_mosh") else "No")]
         dsp = "AVI/MPEG-4 byte-level + librosa"
     elif kind == "OPTICAL":
         rows = [("Modo" if it else "Mode", p["mode"]), ("Motore flow" if it else "Flow engine", eng),
@@ -1595,12 +1718,12 @@ def build_report(kind, p, fps, stt, au_ok, preset, num):
     end = uniq([t for k in kinds for t in TAGS[k][2]])
     ymid = uniq([t for k in kinds for t in TAGS[k][1]] + (["datamosh chain"] if chain else []))
     yend = uniq([t for k in kinds for t in TAGS[k][3]])
-    hashtags = ["datamosh", "loop507"] + mid + ["glitchart", "noai", "generativeaudio", "sounddesign",
-        "aftereffects", "motiondesign", "algorithmicart", f"seed{seed}", "proceduralart", "digitalart",
-        "experimentalvideo", "experimentalsound", "librosa"] + end + ["datamoshing", "compressionart"]
-    yt = ["datamosh", "loop507"] + ymid + ["glitch art", "no ai", "generative audio", "sound design",
-          "after effects", "motion design", "algorithmic art", f"seed {seed}", "procedural art", "digital art",
-          "experimental video", "experimental sound", "librosa"] + yend + ["datamoshing", "compression art"]
+    hashtags = ["datamosh", "loop507"] + mid + ["glitchart", "noai", "generativeaudio",
+        "motiondesign", "algorithmicart", "proceduralart", "digitalart",
+        "experimentalvideo", "experimentalsound"] + end + ["datamoshing", "compressionart"]
+    yt = ["datamosh", "loop507"] + ymid + ["glitch art", "no ai", "generative audio",
+          "motion design", "algorithmic art", "procedural art", "digital art",
+          "experimental video", "experimental sound"] + yend + ["datamoshing", "compression art"]
     sep = "=" * 40
     return "\n".join([sep, "[ ITALIANO ]", sep, *block("it"), "", sep, "[ ENGLISH ]", sep, *block("en"), "",
                       " ".join("#" + t for t in hashtags), "", sep, "[ TAG YOUTUBE — ENGLISH ONLY ]", sep,
@@ -1710,6 +1833,11 @@ if _in_streamlit():
             st.caption("Oltre 60 s il render puo' richiedere diversi minuti: prova prima con l'anteprima.")
         prev_sec = st.slider("Secondi anteprima / Preview seconds", 2, 6, key="prev_sec")
         keep_audio = st.checkbox("Mantieni audio (A o esterno) / Keep audio", key="keep_audio")
+        audio_mosh = st.checkbox("L'audio segue il mosh (Byte) / Audio follows the mosh", key="audio_mosh",
+                                 disabled=not keep_audio,
+                                 help="Dove l'immagine si congela l'audio si ripete, dove salta salta anche lui. Vale per il motore Byte e per le catene che lo contengono.")
+        audio_mosh_amt = st.slider("Quantita' audio rovinato / Audio mosh amount", 0.0, 1.0, step=0.05,
+                                   key="audio_mosh_amt", disabled=not (keep_audio and audio_mosh))
         trigger = st.radio("Trigger audio", OPTS["trigger"], key="trigger",
                            help="Beat = scatti precisi sul tempo del brano (battere piu' forte).")
         onset_thr = st.slider("Soglia onset / Onset threshold", 0.1, 1.0, step=0.05, key="onset_thr")
@@ -1816,14 +1944,16 @@ if _in_streamlit():
         if kind == "CHAIN":
             names = [ss[f"chain_{i}"] for i in range(3) if ss[f"chain_{i}"] != NONE]
             res = run_chain(names, ss, preview, video, src["image"], src["b"], au, tmp, cb)
-            finalize_h264(res["raw"], src["audio"], final, ss["keep_audio"], msec)
-            return final, kind, res["steps"][0][1], res["fps"], {"frames": res["steps"][-1][2]["frames"],
-                                                                "steps": res["steps"]}
+            stt = {"frames": res["steps"][-1][2]["frames"], "steps": res["steps"]}
+            audio = audio_with_mosh(kind, ss, src["audio"], stt, res["fps"], msec, tmp)
+            finalize_h264(res["raw"], audio, final, ss["keep_audio"], msec)
+            return final, kind, res["steps"][0][1], res["fps"], stt
         p = build_params(kind, ss, preview)
         p["au"] = au
         raw = os.path.join(tmp, "raw." + ("avi" if kind == "BYTE" else "mp4"))
         fps, stt = run_engine(kind, p, video, src["image"], src["b"], raw, cb)
-        finalize_h264(raw, src["audio"], final, ss["keep_audio"], msec)
+        audio = audio_with_mosh(kind, ss, src["audio"], stt, fps, msec, tmp)
+        finalize_h264(raw, audio, final, ss["keep_audio"], msec)
         return final, kind, p, fps, stt
 
 
@@ -1856,10 +1986,11 @@ if _in_streamlit():
                 for i, sd in enumerate(seeds):
                     sub = os.path.join(src["tmp"], f"v{i}")
                     os.makedirs(sub, exist_ok=True)
-                    final = render(kind, dict(base, seed=sd), True, dict(src, tmp=sub), au,
+                    vp = base if i == 0 else vary_params(base, kind, random.Random(sd))  # la prima resta quella attuale
+                    final = render(kind, dict(vp, seed=sd), True, dict(src, tmp=sub), au,
                                    lambda v, i=i: bar.progress(min(1.0, (i + v) / 4)))[0]
                     with open(final, "rb") as f:
-                        items.append({"seed": sd, "video": f.read()})
+                        items.append({"seed": sd, "video": f.read(), "params": {k: vp[k] for k in variant_keys(kind)}})
             bar.empty()
             st.session_state["dm_variants"] = {"kind": kind, "items": items}
         except Exception as e:  # noqa: BLE001
