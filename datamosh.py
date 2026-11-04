@@ -70,6 +70,39 @@ def sweep_workdirs(max_age=4 * 3600):
 
 MAX_SEC = 180
 LEN_MODES = ["Manuale / Manual", "Come il brano / As the song", "Come il video / As the video"]
+AUDIO_SRCS = ["Auto", "Audio esterno / External", "Video A", "Video B"]
+TEX_MODES = ["Auto", "Solo Video B / Video B only", "Solo foto / Photo only"]
+PH_MODES = ["Fluido", "Brutale"]
+TEX_KINDS = ("BYTE", "OPTICAL", "RESIDUAL")  # il Video A muove, una texture (Video B o foto) viene deformata
+IMG_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+
+
+def pick_audio(choice, ext, a, b):
+    """Sorgente audio: quella scelta se c'e', altrimenti la prima disponibile tra esterno, Video A e Video B."""
+    want = {AUDIO_SRCS[1]: ext, AUDIO_SRCS[2]: a, AUDIO_SRCS[3]: b}.get(choice)
+    for x in (want, ext, a, b):
+        if x is not None:
+            return x
+    return None
+
+
+def route_image(first, tex_mode, pa, pb, pi):
+    """Dove va la foto: sorgente dell'animazione (Databending, Pixel sort, Foto mosh) oppure texture che il Video A
+    deforma (Byte, Optical, Residuo). Ritorna (immagine sorgente, texture B)."""
+    if first not in TEX_KINDS:
+        return pi, pb
+    if tex_mode == TEX_MODES[1]:
+        return None, pb
+    if tex_mode == TEX_MODES[2]:
+        return None, pi
+    return None, pb or pi
+
+
+def video_size(path):
+    cap = cv2.VideoCapture(path)
+    w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    return w, h
 
 
 def media_seconds(path):
@@ -237,6 +270,23 @@ def make_writer(path, fps, w, h):
     """File .avi = MJPG (quasi senza perdite, per i passaggi intermedi); altrimenti mp4v."""
     code = "MJPG" if str(path).lower().endswith(".avi") else "mp4v"
     return cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*code), fps, (w, h))
+
+
+class StillTexture:
+    """Una foto usata come texture: si legge come un video fermo (ogni lettura ridà lo stesso fotogramma)."""
+
+    def __init__(self, path):
+        self.img = cv2.imread(path)
+
+    def read(self):
+        return (self.img is not None), (None if self.img is None else self.img.copy())
+
+    def release(self):
+        self.img = None
+
+
+def open_texture(path):
+    return StillTexture(path) if str(path).lower().endswith(IMG_EXT) else cv2.VideoCapture(path)
 
 
 def fit_frame(frame, w, h):
@@ -503,7 +553,7 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
     h = max(16, int(oh * scale) // 2 * 2)
     n_max = min(total, int(p["max_sec"] * fps))
 
-    cap_b = cv2.VideoCapture(src_b) if src_b else None
+    cap_b = open_texture(src_b) if src_b else None
 
     writer = make_writer(out_path, fps, w, h)
     grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32),
@@ -611,6 +661,92 @@ def datamosh_video(src_a, src_b, out_path, p, progress_cb=None):
     return fps, stats
 
 
+def synth_flow(mode, state, h, w, p, rng, onset, rms):
+    """Campo di moto inventato dall'audio (la foto non si muove): Fluido = correnti morbide che evolvono piano,
+    Brutale = blocchi che scattano sui colpi e poi restano fermi."""
+    k = p["strength"] * (1.0 + p["a_strength"] * rms)
+    if mode == "Fluido":
+        gh, gw = max(2, h // 40), max(2, w // 40)
+        fld = state.get("fld")
+        if fld is None:
+            fld = rng.normal(0.0, 1.0, (gh, gw, 2)).astype(np.float32)
+        fld = 0.93 * fld + 0.07 * 3.5 * rng.normal(0.0, 1.0, (gh, gw, 2)).astype(np.float32)
+        state["fld"] = fld
+        return cv2.resize(fld, (w, h), interpolation=cv2.INTER_CUBIC) * (3.0 * k * (0.35 + 1.4 * onset))
+    bs = int(p["block"])
+    nby, nbx = max(1, h // bs), max(1, w // bs)
+    hit = rng.random((nby, nbx)) < min(0.9, 0.03 + 0.7 * onset)
+    r = int(6 * k) + 2
+    vec = rng.integers(-r, r + 1, (nby, nbx, 2)).astype(np.float32)
+    return cv2.resize(np.where(hit[..., None], vec, 0.0).astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
+
+
+def photomosh_video(src_video, src_image, out_path, p, progress_cb=None):
+    """Una foto che si distrugge da sola: il movimento non viene da un video ma dall'audio (serve l'audio)."""
+    rng = np.random.default_rng(p["seed"])
+    au = p["au"]
+    img0 = cv2.imread(src_image) if src_image else None
+    if img0 is None:
+        raise RuntimeError("Immagine non leggibile / unreadable image")
+    fps = float(p["fps_img"])
+    n = min(int(p["max_sec"] * fps), int(au["dur"] * fps))
+    if n < 2:
+        raise RuntimeError("Audio troppo corto / audio too short")
+    oh, ow = img0.shape[:2]
+    scale = min(1.0, p["max_w"] / float(ow))
+    w, h = max(16, int(ow * scale) // 2 * 2), max(16, int(oh * scale) // 2 * 2)
+    img = fit_frame(img0, w, h)
+    gray0 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mt, fs, state = p.get("mt"), {}, {}
+    env_on, env_rms = driver_env(au, "Colpi/Beat", 0.8), driver_env(au, "Volume", 0.9)
+    zenv = driver_env(au, mt["zoom_drv"], 0.8) if mt else None
+    grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    writer = make_writer(out_path, fps, w, h)
+    start_f, end_f = int(n * p["mosh_start"] / 100.0), int(n * p["mosh_end"] / 100.0)
+    mosh = img.astype(np.float32)
+    stats = {"frames": 0, "iframes": 0, "holds": 0, "blooms": 0, "ev": [], "source": "image", "mode": p["mode"]}
+    bloom_flow, bloom_left = None, 0
+    for t in range(n):
+        code = 0  # come in Optical: 0 foto pulita, 1 mosh, 2 hold, 3/4 bloom, 5 rinfresco
+        if not (start_f <= t < end_f):
+            mosh, out = img.astype(np.float32), img
+        else:
+            code = 1
+            if p["a_refresh"] and at(au["trig_refresh"], t) > p["refresh_thr"]:
+                mosh, code, bloom_left = img.astype(np.float32), 5, 0
+                stats["iframes"] += 1
+            flow = synth_flow(p["mode"], state, h, w, p, rng, at(env_on, t), at(env_rms, t))
+            raw = flow
+            if rng.random() < p["hold_prob"]:
+                flow, code = np.zeros_like(flow), 2
+                stats["holds"] += 1
+            if bloom_left > 0 and bloom_flow is not None:
+                flow, code = bloom_flow, 4
+                bloom_left -= 1
+            elif (p["a_bloom"] and at(au["trig_bloom"], t) > p["onset_thr"]) or rng.random() < p["bloom_prob"]:
+                bloom_flow = flow.copy() * p["bloom_gain"]
+                bloom_left = int(rng.integers(p["bloom_len"][0], p["bloom_len"][1] + 1))
+                stats["blooms"] += 1
+                code = 3
+            if mt:
+                flow = transform_flow(flow, mt, 1.0 if zenv is None else at(zenv, t), fs, rng, grid_x, grid_y, p["block"])
+            mosh = warp(mosh, flow, grid_x, grid_y)
+            if p["residual"] > 0:  # la foto "ricresce": quanto dell'originale torna a ogni fotogramma
+                mosh = cv2.addWeighted(mosh, 1.0 - p["residual"], img.astype(np.float32), p["residual"], 0)
+            if mt:
+                mk = motion_mask(mt, raw, gray0)
+                if mk is not None:
+                    mosh = mosh * mk[..., None] + img.astype(np.float32) * (1.0 - mk[..., None])
+            out = np.clip(mosh, 0, 255).astype(np.uint8)
+        writer.write(out)
+        stats["ev"].append(code)
+        stats["frames"] += 1
+        if progress_cb and t % 5 == 0:
+            progress_cb(t / max(1, n - 1))
+    writer.release()
+    return fps, stats
+
+
 def residual_video(src_a, src_b, out_path, p, progress_cb=None):
     """Simula un decoder P-frame: out = warp(out_prev, moto) + guadagno * residuo (accumulo + clipping).
     Con guadagno > 1 e quantizzazione l'errore si accumula: colori saturi e coriandoli sui bordi."""
@@ -625,7 +761,7 @@ def residual_video(src_a, src_b, out_path, p, progress_cb=None):
     scale = min(1.0, p["max_w"] / float(ow))
     w, h = max(16, int(ow * scale) // 2 * 2), max(16, int(oh * scale) // 2 * 2)
     n_max = min(total, int(p["max_sec"] * fps))
-    cap_b = cv2.VideoCapture(src_b) if src_b else None
+    cap_b = open_texture(src_b) if src_b else None
     writer = make_writer(out_path, fps, w, h)
     gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
     start_f, end_f = int(n_max * p["mosh_start"] / 100), int(n_max * p["mosh_end"] / 100)
@@ -1360,18 +1496,22 @@ DEFAULTS = {
     "db_d_crush": "Acuti", "db_d_hp": "Acuti", "db_d_dist": "Volume", "db_d_slip": "Colpi/Beat",
     "db_scan": "Orizzontale", "db_space": "BGR", "db_tile": 32,
     "db_delay": 0.37, "db_align": False, "db_release": 0.8, "db_mem": 0.0, "db_zone": (0, 100), "db_fps": 30,
+    "ph_mode": PH_MODES[0], "ph_block": 16, "ph_strength": 1.5, "ph_regen": 0.04, "ph_hold": 0.05, "ph_bloom": True,
+    "ph_bloom_gain": 2.5, "ph_bloom_len": (6, 24), "ph_asr": 1.0, "ph_refresh": True, "ph_refresh_thr": 0.85, "ph_fps": 30,
+    "audio_src": AUDIO_SRCS[0], "tex_src": TEX_MODES[0],
 }
 
-for _p in ("mt2", "mt4"):  # trasformazioni del moto: stesse impostazioni, una copia per tab
+for _p in ("mt2", "mt4", "mt7"):  # trasformazioni del moto: stesse impostazioni, una copia per tab
     DEFAULTS.update({f"{_p}_{_k}": _v for _k, _v in MT_DEFAULTS.items()})
 
-KEEP = ("fmt", "fit", "beat_offset", "downbeat", "show_wave", "seed", "max_w", "max_sec", "len_mode", "prev_sec", "keep_audio", "audio_mosh", "audio_mosh_amt", "bpm_manual", "meter", "flow_engine")
+KEEP = ("fmt", "fit", "beat_offset", "downbeat", "show_wave", "seed", "max_w", "max_sec", "len_mode", "prev_sec", "keep_audio", "audio_mosh", "audio_mosh_amt", "bpm_manual", "meter", "flow_engine", "audio_src", "tex_src")
 
 OPTS = {"trigger": ["Onset", "Beat (a tempo)", "Onset + Beat"], "drop_mode": ["Su onset", "Tutti", "Mai"],
         "mode": ["Block MV", "Optical Flow"], "rs_block": [8, 16, 32, 64], "block": [8, 16, 32, 64], "meter": list(ACC),
         "max_w": [320, 480, 640, 854, 1280], "len_mode": LEN_MODES, "fmt": FORMATS, "fit": FIT_MODES, "flow_engine": ["DIS (veloce)", "Farneback"], "ps_fps": [24, 25, 30], "ps_key": PS_KEYS, "ps_imode": PS_MODES, "ps_drv": DRIVERS,
         "db_fps": [24, 25, 30], "db_scan": ["Orizzontale", "Verticale", "Blocchi"],
         "db_space": ["BGR", "YCrCb"], "db_tile": [16, 32, 64],
+        "ph_mode": PH_MODES, "ph_block": [8, 16, 32, 64], "ph_fps": [24, 25, 30], "audio_src": AUDIO_SRCS, "tex_src": TEX_MODES,
         **{"db_d_" + k: DRIVERS for k in FX}}
 
 LIM = {"seed": (0, 2**31 - 1), "audio_mosh_amt": (0.0, 1.0), "mosh_range": (0, 100), "max_sec": (2, MAX_SEC), "prev_sec": (2, 6),
@@ -1384,9 +1524,11 @@ LIM = {"seed": (0, 2**31 - 1), "audio_mosh_amt": (0.0, 1.0), "mosh_range": (0, 1
        "rs_mv_noise": (0.0, 8.0), "rs_hold": (0.0, 0.5), "rs_bloom_gain": (1.0, 5.0), "rs_bloom_len": (2, 60),
        "rs_asr": (0.0, 3.0), "rs_refresh_thr": (0.5, 1.0), "rs_decay": (0.0, 0.3), "rs_grain": (0.0, 12.0),
        "ps_range": (0.0, 1.0), "ps_angle": (0, 175), "ps_maxlen": (0, 400), "ps_skip": (0.0, 0.95),
-       "ps_mix": (0.0, 1.0), "ps_expand": (0.0, 0.6), "ps_release": (0.0, 0.95), **{"db_" + k: (0.0, 1.0) for k in FX}}
+       "ps_mix": (0.0, 1.0), "ps_expand": (0.0, 0.6), "ps_release": (0.0, 0.95), **{"db_" + k: (0.0, 1.0) for k in FX},
+       "ph_strength": (0.2, 4.0), "ph_regen": (0.0, 0.5), "ph_hold": (0.0, 0.5), "ph_bloom_gain": (1.0, 5.0),
+       "ph_bloom_len": (2, 60), "ph_asr": (0.0, 3.0), "ph_refresh_thr": (0.5, 1.0)}
 
-for _p in ("mt2", "mt4"):
+for _p in ("mt2", "mt4", "mt7"):
     OPTS.update({f"{_p}_zoom_drv": DRIVERS, f"{_p}_mirror": ["No", "Orizzontale", "Verticale"], f"{_p}_mask": MASKS})
     LIM.update({f"{_p}_{_k}": _v for _k, _v in MT_LIM.items()})
 
@@ -1615,9 +1757,9 @@ def valid(k, v):
 VAR_PREFIX = {"BYTE": ("kf", "qscale", "drop_mode", "drop_thr", "max_dup", "corrupt", "quiet_thr", "kf_on_audio"),
               "OPTICAL": ("mode", "block", "strength", "mv_noise", "hold_prob", "bloom_gain", "bloom_len", "residual",
                           "a_strength", "a_bloom", "a_refresh", "refresh_thr", "mt2_"),
-              "RESIDUAL": ("rs_", "mt4_"), "DATABEND": ("db_",), "PIXELSORT": ("ps_",)}
+              "RESIDUAL": ("rs_", "mt4_"), "DATABEND": ("db_",), "PIXELSORT": ("ps_",), "PHOTO": ("ph_", "mt7_")}
 VAR_COMMON = ("mosh_range", "onset_thr", "bloom_prob", "trigger")
-VAR_SKIP = ("db_fps", "ps_fps", "db_tile")
+VAR_SKIP = ("db_fps", "ps_fps", "ph_fps", "db_tile")
 
 
 def variant_keys(kind):
@@ -1663,10 +1805,11 @@ def vary_params(base, kind, rng, amount=0.75):
 # ----------------------------------------------------------------------------
 NONE = "— nessuno —"
 STEPS = {"Byte": "BYTE", "Optical": "OPTICAL", "Databending": "DATABEND", "Residuo": "RESIDUAL",
-         "Pixel sort": "PIXELSORT"}
+         "Pixel sort": "PIXELSORT", "Foto mosh": "PHOTO"}
 DEFAULTS.update({"chain_0": "Databending", "chain_1": "Residuo", "chain_2": NONE})
 OPTS.update({f"chain_{i}": [NONE] + list(STEPS) for i in range(3)})
 TAB_LABELS.append("6 // CATENA")
+TAB_LABELS.append("7 // FOTO MOSH")
 PRESETS["Catena sporca"] = (
     "Tab 6 Catena :: databending leggero, poi pixel sort, poi residuo: tutto insieme sul tuo audio, con l'immagine ancora leggibile.",
     {
@@ -1706,6 +1849,16 @@ PRESETS["Catena a tempo"] = (
     })
 
 
+PRESETS["Foto che si scioglie"] = (
+    "Tab 7 Foto mosh :: correnti morbide guidate dall'audio: la foto cola, ruota e si ricompone sui colpi forti (serve la foto e un audio).",
+    {"trigger": "Beat (a tempo)", "ph_mode": "Fluido", "ph_strength": 1.5, "ph_regen": 0.03, "ph_refresh": True,
+     "ph_refresh_thr": 0.9, "mt7_fluid": 0.4, "mt7_rot": 0.3, "mt7_zoom": 0.3, "mt7_zoom_drv": "Colpi/Beat"})
+PRESETS["Foto a strappi"] = (
+    "Tab 7 Foto mosh :: blocchi che scattano sui colpi e poi restano congelati: la foto si spezza a tempo (serve la foto e un audio).",
+    {"ph_mode": "Brutale", "ph_block": 32, "ph_strength": 1.5, "ph_hold": 0.1, "ph_regen": 0.02, "ph_bloom_gain": 3.0,
+     "mt7_shift": 0.3})
+
+
 def mt_from_state(ss, pfx):
     return {k: ss[f"{pfx}_{k}"] for k in MT_DEFAULTS}
 
@@ -1740,6 +1893,12 @@ def build_params(kind, ss, preview=False):
                   "a_strength": ss["rs_asr"], "a_refresh": ss["rs_refresh"], "refresh_thr": ss["rs_refresh_thr"],
                   "flow_engine": ss["flow_engine"], "decay": ss["rs_decay"], "grain": ss["rs_grain"],
                   "mt": mt_from_state(ss, "mt4")})
+    elif kind == "PHOTO":
+        p.update({"mode": ss["ph_mode"], "block": int(ss["ph_block"]), "strength": ss["ph_strength"],
+                  "residual": ss["ph_regen"], "hold_prob": ss["ph_hold"], "a_bloom": ss["ph_bloom"],
+                  "bloom_gain": ss["ph_bloom_gain"], "bloom_len": (int(ss["ph_bloom_len"][0]), int(ss["ph_bloom_len"][1])),
+                  "a_strength": ss["ph_asr"], "a_refresh": ss["ph_refresh"], "refresh_thr": ss["ph_refresh_thr"],
+                  "fps_img": ss["ph_fps"], "mt": mt_from_state(ss, "mt7")})
     elif kind == "DATABEND":
         p.update({"db_fx": {k: ss["db_" + k] for k in FX}, "db_drv": {k: ss["db_d_" + k] for k in FX},
                   "delay": ss["db_delay"], "align": ss["db_align"], "release": ss["db_release"],
@@ -1780,8 +1939,13 @@ def decode_mid(avi, out):
 
 def run_engine(kind, p, src_video, src_image, src_b, out_path, progress_cb=None):
     """Esegue un motore. BYTE scrive un AVI MPEG-4 byte-level; gli altri un video (mp4 o avi MJPG)."""
+    tex = None if not src_b else ("image" if str(src_b).lower().endswith(IMG_EXT) else "video")
     if kind == "BYTE":
-        return byte_datamosh(src_video, src_b, out_path, p)
+        fps, stt = byte_datamosh(src_video, src_b, out_path, p)
+        stt["tex"] = tex
+        return fps, stt
+    if kind == "PHOTO":
+        return photomosh_video(src_video, src_image, out_path, p, progress_cb)
     if kind == "DATABEND":
         return databend_video(src_video, src_image, out_path, p, progress_cb)
     if kind == "PIXELSORT":
@@ -1789,6 +1953,7 @@ def run_engine(kind, p, src_video, src_image, src_b, out_path, progress_cb=None)
     fn = datamosh_video if kind == "OPTICAL" else residual_video
     fps, stt = fn(src_video, src_b, out_path, p, progress_cb)
     stt["transfer"] = src_b is not None
+    stt["tex"] = tex
     return fps, stt
 
 
@@ -1798,9 +1963,11 @@ def run_chain(steps, ss, preview, src_video, src_image, src_b, au, tmp, progress
     kinds = [STEPS[s] for s in steps]
     if not kinds:
         raise RuntimeError("Scegli almeno un effetto / pick at least one effect")
-    if src_image and kinds[0] not in ("DATABEND", "PIXELSORT"):
-        raise RuntimeError("L'immagine fissa funziona solo se il primo passo e' Databending o Pixel sort / "
-                           "a still image needs Databending or Pixel sort as the first step")
+    if src_image and kinds[0] not in ("DATABEND", "PIXELSORT", "PHOTO"):
+        raise RuntimeError("L'immagine fissa funziona solo se il primo passo e' Databending, Pixel sort o Foto mosh / "
+                           "a still image needs Databending, Pixel sort or Photo mosh as the first step")
+    if "PHOTO" in kinds[1:]:
+        raise RuntimeError("Foto mosh puo' essere solo il primo passo / Photo mosh can only be the first step")
     results, cur_video, cur_image, fps, out = [], src_video, src_image, 25.0, None
     for i, kind in enumerate(kinds):
         last = i == len(kinds) - 1
@@ -1833,7 +2000,7 @@ PRESET_EN = {"Manuale": "Manual", "Glitch ritmico a tempo": "Rhythmic Glitch", "
              "Vortice": "Vortex", "Specchio": "Mirror", "Confetti sui movimenti": "Motion Confetti",
              "Confetti a decadimento": "Decaying Confetti", "Cascata": "Waterfall", "Fiamma": "Flame",
              "Bordi sciolti": "Melted Edges", "Pioggia a tempo": "Beat Rain", "Diagonale a righe": "Striped Diagonal", "Confetti fine": "Fine Confetti",
-             "Confetti a ondate": "Confetti Waves", "Catena sporca": "Dirty Chain", "Catena a tempo": "Beat Chain", "Residuo estremo": "Extreme Residual", "Pioggia digitale": "Digital Rain", "Blocchi corrotti": "Corrupted Blocks"}
+             "Confetti a ondate": "Confetti Waves", "Catena sporca": "Dirty Chain", "Catena a tempo": "Beat Chain", "Residuo estremo": "Extreme Residual", "Foto che si scioglie": "Melting Photo", "Foto a strappi": "Torn Photo", "Pioggia digitale": "Digital Rain", "Blocchi corrotti": "Corrupted Blocks"}
 
 
 SCAN_EN = {"Orizzontale": "Horizontal", "Verticale": "Vertical", "Blocchi": "Blocks"}
@@ -1875,6 +2042,7 @@ TAGS = {  # (hashtag centrali, tag YouTube centrale, hashtag finali, tag YouTube
     "DATABEND": (["databending"], ["databending"], ["numpy", "scipy"], ["numpy", "scipy"]),
     "RESIDUAL": (["residualmosh"], ["residual mosh"], ["pframe"], ["p-frame"]),
     "PIXELSORT": (["pixelsorting"], ["pixel sorting"], ["numpy"], ["numpy"]),
+    "PHOTO": (["photodatamosh"], ["photo datamosh"], ["audioreactive"], ["audio reactive"]),
 }
 
 
@@ -1901,6 +2069,12 @@ def step_rows(kind, p, stt, it):
                 ("I-frame", stt["iframes"]), ("Hold", stt["holds"]), ("Bloom", stt["blooms"]),
                 ("Transfer", yn(stt["transfer"]))]
         dsp = f"OpenCV {eng} flow + residual accumulation + librosa"
+    elif kind == "PHOTO":
+        rows = [("Modo" if it else "Mode", p["mode"]), ("Sorgente" if it else "Source", "Immagine" if it else "Still image"),
+                ("Blocco" if it else "Block", p["block"]), ("Forza" if it else "Strength", p["strength"]),
+                ("Rigenerazione" if it else "Regeneration", p["residual"]),
+                ("I-frame", stt["iframes"]), ("Hold", stt["holds"]), ("Bloom", stt["blooms"])]
+        dsp = "NumPy/OpenCV audio-driven synthetic motion + librosa"
     elif kind == "PIXELSORT":
         src = "Video" if stt["source"] == "video" else ("Immagine" if it else "Still image")
         lo, hi = p["range"]
@@ -1922,7 +2096,9 @@ def step_rows(kind, p, stt, it):
                 ("Spazio colore" if it else "Color space", stt["space"]),
                 ("Frame piegati" if it else "Bent frames", stt["bent"])]
         dsp = "NumPy/SciPy signal databending + librosa"
-    d = mt_desc(p.get("mt"), it) if kind in ("OPTICAL", "RESIDUAL") else ""
+    if kind in TEX_KINDS and stt.get("transfer") and stt.get("tex") == "image":
+        rows.append(("Texture", "Foto" if it else "Photo"))
+    d = mt_desc(p.get("mt"), it) if kind in ("OPTICAL", "RESIDUAL", "PHOTO") else ""
     if d:
         rows.append(("Moto" if it else "Motion", d))
     if kind == "RESIDUAL" and p.get("decay", 0) > 0:
@@ -2076,8 +2252,13 @@ if _in_streamlit():
     up_b = c2.file_uploader("Video B opzionale (immagine/texture che A deforma)", type=VT, key="b")
     up_au = st.file_uploader("Audio esterno opzionale (il tuo brano: guida il mosh e diventa la colonna sonora)",
                              type=["wav", "mp3", "flac", "ogg", "m4a", "aac"], key="au")
-    up_img = st.file_uploader("Immagine fissa opzionale (tab 3 Databending, 5 Pixel sort, 6 Catena: si anima col brano, serve l'audio esterno)",
+    up_img = st.file_uploader("Foto opzionale (tab 3 Databending, 5 Pixel sort, 7 Foto mosh, 6 Catena: si anima col brano, serve un audio; "
+                              "oppure texture che il Video A deforma in Byte, Optical e Residuo)",
                               type=["png", "jpg", "jpeg", "bmp", "webp"], key="img")
+    if up_img is not None:
+        st.radio("Foto come texture (Byte, Optical, Residuo) / Photo as texture", OPTS["tex_src"], key="tex_src", horizontal=True,
+                 help="Con la foto e il Video A: Auto = la foto prende il posto del Video B (se non c'e') e A la deforma. "
+                      "Solo Video B = come prima, la foto serve solo agli altri tab. Solo foto = ignora il Video B.")
 
     @st.cache_data(show_spinner=False, max_entries=16, ttl=3600)
     def cached_seconds(key, _data, name, what):
@@ -2099,7 +2280,7 @@ if _in_streamlit():
         mode = mode or ss["len_mode"]
         if mode == LEN_MODES[0]:
             return int(ss["max_sec"])
-        src = up_au or up_a
+        src = pick_audio(ss["audio_src"], up_au, up_a, up_b)
         song = cached_seconds(upload_key(src), src.getbuffer(), src.name, "media") if src is not None else None
         video = cached_seconds(upload_key(up_a), up_a.getbuffer(), up_a.name, "video") if up_a is not None else None
         want = song if mode == LEN_MODES[1] else video
@@ -2131,14 +2312,17 @@ if _in_streamlit():
         st.radio("Adattamento al formato / Fit", OPTS["fit"], key="fit", horizontal=True,
                  help="Ritaglia = riempie il formato tagliando i bordi; Bordi neri = mostra tutta l'immagine.")
         len_mode = st.radio("Durata / Length", OPTS["len_mode"], key="len_mode",
-                            help="Manuale = usa il cursore. Come il brano = tutta la durata dell'audio (quello esterno, altrimenti "
-                                 "quello del Video A). Come il video = tutta la durata del Video A. Massimo 3 minuti.")
+                            help="Manuale = usa il cursore. Come il brano = tutta la durata dell'audio scelto in 'Sorgente audio'. "
+                                 "Come il video = tutta la durata del Video A. Massimo 3 minuti.")
         st.slider("Durata max (s) / Max seconds", 2, MAX_SEC, key="max_sec", disabled=len_mode != LEN_MODES[0])
         sel_sec = current_seconds(len_mode)
         if sel_sec > 60:
             st.caption("Oltre 60 s il render puo' richiedere diversi minuti: prova prima con l'anteprima.")
         prev_sec = st.slider("Secondi anteprima / Preview seconds", 2, 6, key="prev_sec")
-        keep_audio = st.checkbox("Mantieni audio (A o esterno) / Keep audio", key="keep_audio")
+        keep_audio = st.checkbox("Mantieni audio / Keep audio", key="keep_audio")
+        st.radio("Sorgente audio / Audio source", OPTS["audio_src"], key="audio_src",
+                 help="Guida il mosh e diventa la colonna sonora. Auto = audio esterno se c'e', altrimenti quello del Video A. "
+                      "Se il file scelto non e' caricato si usa il primo disponibile (esterno, Video A, Video B).")
         audio_mosh = st.checkbox("L'audio viene rovinato come l'effetto / Audio destroyed like the effect", key="audio_mosh",
                                  disabled=not keep_audio,
                                  help="Byte: dove l'immagine si congela o salta, si ripete o salta anche il suono. Optical e Residuo: stutter e bitcrush su hold e bloom. Databending: gli stessi effetti (eco, riverbero, bitcrush, distorsione...) con gli stessi pilotaggi. Pixel sort: smear e crush sulla forza dell'effetto. Vale anche per le catene.")
@@ -2207,8 +2391,8 @@ if _in_streamlit():
         return h.hexdigest()
 
 
-    def au_for(pa, pau, msec, fps=None):
-        return compute_au(st.session_state, pau or pa, msec, fps or video_fps(pa),
+    def au_for(pa, aud, msec, fps=None):
+        return compute_au(st.session_state, aud, msec, fps or video_fps(pa),
                           features=lambda s, f, n, m, b, a, o, d: features_from_analysis(
                               cached_analysis(file_digest(s), s, m), f, n, b, a, o, d))
 
@@ -2232,31 +2416,44 @@ if _in_streamlit():
         """Salva i file, li porta al formato scelto, controlla le combinazioni e calcola l'audio (dall'originale)."""
         tmp, pa, pb, pau, pi = save_uploads()
         try:
-            pi = pi if kind in ("DATABEND", "PIXELSORT", "CHAIN") else None  # l'immagine fissa serve solo a questi
-            if pi and not pau:
-                raise RuntimeError("Per animare l'immagine serve un audio esterno / an audio file is required")
             first = kind
             if kind == "CHAIN":
                 names = [ss[f"chain_{i}"] for i in range(3) if ss[f"chain_{i}"] != NONE]
                 if not names:
                     raise RuntimeError("Scegli almeno un effetto / pick at least one effect")
                 first = STEPS[names[0]]
-            img_fps = float(ss["db_fps"] if first == "DATABEND" else ss["ps_fps"]) if pi else None
-            song = media_seconds(pau or pa) if (pau or pa) else None  # brano = audio esterno, altrimenti l'audio del Video A
+            if first in TEX_KINDS and not pa:
+                raise RuntimeError("Serve il Video A (il movimento) / Video A is required")
+            if first == "PHOTO" and not pi:
+                raise RuntimeError("Foto mosh richiede una foto / Photo mosh needs a still image")
+            aud = pick_audio(ss["audio_src"], pau, pa, pb)  # prima dell'instradamento: B puo' essere solo l'audio
+            pi, pb = route_image(first, ss["tex_src"], pa, pb, pi)  # la foto: sorgente oppure texture del Video A
+            pi = pi if first in ("DATABEND", "PIXELSORT", "PHOTO") else None  # l'immagine fissa come sorgente serve solo a questi
+            if pi and aud is None:
+                raise RuntimeError("Per animare l'immagine serve un audio (esterno, Video A o Video B) / an audio source is required")
+            img_fps = float(ss[{"DATABEND": "db_fps", "PIXELSORT": "ps_fps", "PHOTO": "ph_fps"}[first]]) if pi else None
+            song = media_seconds(aud) if aud else None  # brano = la sorgente audio scelta
             ss["eff_sec"] = pick_seconds(ss, song, video_seconds(pa) if pa else None)
             cp = common_params(ss, preview)
-            au = au_for(pa, pau, cp["max_sec"], img_fps)
+            au = au_for(pa, aud, cp["max_sec"], img_fps)
             if pi and not au["ok"]:
                 raise RuntimeError("Audio non leggibile / audio unreadable")
-            src = {"tmp": tmp, "video": pa, "b": pb, "image": pi, "audio": pau or pa}
+            src = {"tmp": tmp, "video": pa, "b": pb, "image": pi, "audio": aud}
+            tex_img = bool(pb) and str(pb).lower().endswith(IMG_EXT)
             if cp["fmt"] != "Originale":
                 tw, th = format_size(cp["fmt"], cp["max_w"])
                 if pi:
                     src["image"] = format_image(pi, os.path.join(tmp, "fmt_img.png"), tw, th, cp["fit"])
                 elif pa:
                     src["video"] = format_video(pa, os.path.join(tmp, "fmt_a.avi"), tw, th, cp["fit"], cp["max_sec"])
-                if pb:
+                if pb and not tex_img:
                     src["b"] = format_video(pb, os.path.join(tmp, "fmt_b.avi"), tw, th, cp["fit"], cp["max_sec"])
+            if tex_img:  # la foto-texture ha la forma del Video A (o del formato scelto): niente stiramenti
+                if cp["fmt"] == "Originale":
+                    ow, oh = video_size(pa)
+                    sc = min(1.0, cp["max_w"] / float(max(1, ow)))
+                    tw, th = max(16, int(ow * sc) // 2 * 2), max(16, int(oh * sc) // 2 * 2)
+                src["b"] = format_image(pb, os.path.join(tmp, "fmt_tex.png"), tw, th, cp["fit"])
             return src, au
         except Exception:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -2352,7 +2549,7 @@ if _in_streamlit():
 
     def waveform_view():
         """Forma d'onda con i beat rilevati: si vede subito se il tempo e' giusto."""
-        up = up_au or up_a
+        up = pick_audio(st.session_state["audio_src"], up_au, up_a, up_b)
         if up is None:
             st.info("Carica un audio o un video per vedere la forma d'onda.")
             return
@@ -2411,13 +2608,13 @@ if _in_streamlit():
         waveform_view()
 
     try:  # Streamlit recente: i tab ricordano la selezione e si possono cambiare da codice
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(TAB_LABELS, key="active_tab", on_change="rerun")
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(TAB_LABELS, key="active_tab", on_change="rerun")
     except TypeError:  # versione vecchia: nessun cambio automatico di tab
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(TAB_LABELS)
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(TAB_LABELS)
 
     with tab1:
         st.write("Elimina I-frame, duplica P-frame e corrompe byte :: guidato dall'audio. "
-                 "Con il Video B: l'immagine e' di B, il movimento di A.")
+                 "Con il Video B (o con una foto): l'immagine e' di B, il movimento di A.")
         a, b, c = st.columns(3)
         drop_mode = a.radio("Elimina I-frame / Drop I-frames", OPTS["drop_mode"], key="drop_mode")
         max_dup = b.slider("Max duplicati P per onset / Max P dups", 1, 40, key="max_dup")
@@ -2439,7 +2636,7 @@ if _in_streamlit():
             run_variants("BYTE")
 
     with tab2:
-        st.write("Optical flow :: transfer A->B opzionale :: guidato dall'audio.")
+        st.write("Optical flow :: transfer A->B opzionale (B = Video B o foto) :: guidato dall'audio.")
         a, b, c = st.columns(3)
         mode = a.radio("Modo / Mode", OPTS["mode"], key="mode")
         strength = b.slider("Forza / Strength", 0.2, 4.0, step=0.1, key="strength")
@@ -2469,7 +2666,7 @@ if _in_streamlit():
 
     with tab3:
         st.write("I pixel diventano un segnale audio e passano negli effetti sonori. Funziona su un video (Video A) oppure su "
-                 "un'immagine fissa che si anima col brano (Immagine + Audio esterno). Se carichi entrambi, usa l'immagine.")
+                 "una foto che si anima col brano (Foto + un audio). Se carichi entrambi, usa la foto.")
         labels = {"echo": "Eco / Echo", "reverb": "Riverbero / Reverb", "invert": "Inverti / Invert", "burn": "Amplifica / Burn",
                   "crush": "Bitcrush", "hp": "Passa-alto / Edge", "dist": "Distorsione / Distortion", "slip": "Slittamento byte / Slip"}
         s1, s2, s3 = st.columns(3)
@@ -2506,7 +2703,7 @@ if _in_streamlit():
 
     with tab4:
         st.write("Simula un decoder che accumula i residui dei P-frame senza mai azzerare l'errore: colori saturi, coriandoli "
-                 "sui bordi e code dove ci si muove. Il Video B (opzionale) diventa l'immagine di partenza.")
+                 "sui bordi e code dove ci si muove. Il Video B o la foto (opzionali) diventano l'immagine di partenza.")
         a, b, c = st.columns(3)
         a.slider("Guadagno luma / Luma gain", 0.0, 3.0, step=0.05, key="rs_luma")
         b.slider("Guadagno colore / Chroma gain", 0.0, 4.0, step=0.05, key="rs_chroma")
@@ -2540,7 +2737,7 @@ if _in_streamlit():
     with tab5:
         st.write("Ordina i pixel di righe o colonne dentro intervalli scelti da una soglia: colate, cascate e righe. "
                  "La soglia si allarga sui colpi. Funziona su un video (Video A) oppure su un'immagine fissa che si anima col brano "
-                 "(Immagine + Audio esterno).")
+                 "(Foto + un audio).")
         a5, b5, c5 = st.columns(3)
         a5.selectbox("Ordina per / Sort key", PS_KEYS, key="ps_key")
         b5.radio("Intervalli / Intervals", PS_MODES, key="ps_imode", horizontal=True,
@@ -2571,7 +2768,7 @@ if _in_streamlit():
     with tab6:
         st.write("Concatena fino a 3 effetti: ogni passo lavora sul video del precedente, con lo stesso audio. "
                  "Ogni effetto usa le impostazioni attuali del suo tab: regolale prima, oppure scegli un preset. "
-                 "Con un'immagine fissa il primo passo deve essere Databending o Pixel sort.")
+                 "Con una foto come sorgente il primo passo deve essere Databending, Pixel sort o Foto mosh (che puo' stare solo al primo posto).")
         ccols = st.columns(3)
         for i, col in enumerate(ccols):
             col.selectbox(f"Passo {i + 1}", OPTS[f"chain_{i}"], key=f"chain_{i}")
@@ -2588,6 +2785,40 @@ if _in_streamlit():
             finish(run_effect("CHAIN", pv6), pv6)
         if var6:
             run_variants("CHAIN")
+
+
+    with tab7:
+        st.write("Datamosh su una foto, senza video di movimento: il movimento lo inventa l'audio. Fluido = correnti morbide che "
+                 "fanno colare la foto; Brutale = blocchi che scattano sui colpi e restano congelati. Serve la foto e un audio "
+                 "(esterno, Video A o Video B). Per far muovere la foto da un video vero, usa la foto come texture nei tab 1, 2 e 4.")
+        a7, b7, c7 = st.columns(3)
+        a7.radio("Carattere / Style", PH_MODES, key="ph_mode", horizontal=True,
+                 help="Fluido: correnti morbide che evolvono piano. Brutale: blocchi che scattano e poi stanno fermi.")
+        b7.slider("Forza / Strength", 0.2, 4.0, step=0.1, key="ph_strength")
+        c7.slider("Rigenerazione della foto / Regrowth", 0.0, 0.5, step=0.01, key="ph_regen",
+                  help="Quanta foto originale torna a ogni fotogramma: alto = la foto resta leggibile.")
+        with st.expander("Avanzati / Advanced"):
+            a8, b8, c8 = st.columns(3)
+            a8.select_slider("Blocco (Brutale) / Block", OPTS["ph_block"], key="ph_block")
+            a8.slider("RMS -> forza / strength", 0.0, 3.0, step=0.1, key="ph_asr")
+            a8.select_slider("FPS", OPTS["ph_fps"], key="ph_fps")
+            b8.checkbox("Onset -> bloom", key="ph_bloom")
+            b8.slider("Bloom gain", 1.0, 5.0, step=0.1, key="ph_bloom_gain")
+            b8.slider("Bloom durata / length", 2, 60, key="ph_bloom_len")
+            c8.checkbox("Onset forte -> foto pulita / strong onset refresh", key="ph_refresh")
+            c8.slider("Soglia refresh / Refresh thr", 0.5, 1.0, step=0.05, key="ph_refresh_thr")
+            c8.slider("Hold prob", 0.0, 0.5, step=0.01, key="ph_hold")
+        with st.expander("Trasformazioni del moto / Motion transforms"):
+            motion_controls("mt7")
+        r1, r2, r3 = st.columns(3)
+        nodata7 = up_img is None or pick_audio(st.session_state["audio_src"], up_au, up_a, up_b) is None
+        go7 = r1.button("GENERA FOTO MOSH / GENERATE", type="primary", disabled=nodata7)
+        pv7 = r2.button("ANTEPRIMA / PREVIEW", disabled=nodata7, key="pv7")
+        var7 = r3.button("4 VARIANTI / 4 VARIANTS", disabled=nodata7, key="var7")
+        if go7 or pv7:
+            finish(run_effect("PHOTO", pv7), pv7)
+        if var7:
+            run_variants("PHOTO")
 
 
     def dl_button(*args, **kw):
