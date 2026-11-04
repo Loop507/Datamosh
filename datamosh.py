@@ -13,12 +13,15 @@ Minimalismo Computazionale / Glitch Brutalista.
 
 import hashlib
 import json
+import math
 import os
 import random
 import re
+import shutil
 import struct
 import subprocess
 import tempfile
+import time
 import wave
 
 from scipy.signal import lfilter
@@ -39,6 +42,75 @@ except Exception:  # fallback: ffmpeg di sistema
     FFMPEG = "ffmpeg"
 
 
+WORK_PREFIX = "datamosh_"
+
+
+def workdir():
+    """Cartella di lavoro con prefisso riconoscibile: chi la crea la cancella, e quelle orfane le spazza sweep_workdirs."""
+    return tempfile.mkdtemp(prefix=WORK_PREFIX)
+
+
+def sweep_workdirs(max_age=4 * 3600):
+    """Cancella le cartelle di lavoro rimaste da render interrotti (piu' vecchie di max_age secondi)."""
+    root, now, n = tempfile.gettempdir(), time.time(), 0
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+    for name in names:
+        path = os.path.join(root, name)
+        try:
+            if name.startswith(WORK_PREFIX) and os.path.isdir(path) and now - os.path.getmtime(path) > max_age:
+                shutil.rmtree(path, ignore_errors=True)
+                n += 1
+        except OSError:
+            continue
+    return n
+
+
+MAX_SEC = 180
+LEN_MODES = ["Manuale / Manual", "Come il brano / As the song", "Come il video / As the video"]
+
+
+def media_seconds(path):
+    """Durata dichiarata dal file (audio o video), letta da ffmpeg; None se non la dice."""
+    try:
+        r = subprocess.run([FFMPEG, "-hide_banner", "-i", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError:
+        return None
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr.decode("utf-8", "ignore"))
+    return None if not m else int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+
+
+def video_seconds(path):
+    """Durata del video come la vedono i motori: fotogrammi / fps (se manca, quella dichiarata dal file)."""
+    cap = cv2.VideoCapture(path)
+    n, fps = cap.get(cv2.CAP_PROP_FRAME_COUNT), cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    return float(n / fps) if n > 0 and fps > 0 else media_seconds(path)
+
+
+def pick_seconds(ss, song, video):
+    """Durata del render: cursore (Manuale), oppure lunghezza del brano o del video, tra 2 s e MAX_SEC."""
+    mode = ss.get("len_mode", LEN_MODES[0])
+    d = song if mode == LEN_MODES[1] else video if mode == LEN_MODES[2] else None
+    if not d or d <= 0:
+        return int(ss["max_sec"])
+    return int(max(2, min(MAX_SEC, math.ceil(d - 0.05))))
+
+
+def eff_seconds(ss):
+    """Durata del render finale: quella calcolata sui file (eff_sec) se la modalita' non e' Manuale, altrimenti il cursore."""
+    if ss.get("len_mode", LEN_MODES[0]) != LEN_MODES[0] and ss.get("eff_sec"):
+        return int(ss["eff_sec"])
+    return int(ss["max_sec"])
+
+
+def fmt_time(sec):
+    sec = int(round(sec))
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
 def at(arr, k):
     return float(arr[min(int(k), len(arr) - 1)])
 
@@ -53,12 +125,13 @@ def zero_au(n):
 
 def analyze_audio(src, max_sec):
     """Parte pesante (da tenere in cache): decodifica e analisi. Ritorna None se non c'e' audio."""
-    wav = os.path.join(tempfile.mkdtemp(), "a.wav")
     try:
-        subprocess.run([FFMPEG, "-y", "-i", src, "-t", str(max_sec), "-vn", "-ac", "1",
-                        "-ar", "22050", wav], check=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        y, sr = librosa.load(wav, sr=22050, mono=True)
+        with tempfile.TemporaryDirectory(prefix=WORK_PREFIX) as td:
+            wav = os.path.join(td, "a.wav")
+            subprocess.run([FFMPEG, "-y", "-i", src, "-t", str(max_sec), "-vn", "-ac", "1",
+                            "-ar", "22050", wav], check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            y, sr = librosa.load(wav, sr=22050, mono=True)
     except Exception:  # noqa: BLE001
         return None
     if y.size < 4096:
@@ -694,15 +767,33 @@ def format_image(src, out_png, tw, th, fit):
     return out_png
 
 
+MAX_FILE_MB = 120  # peso massimo voluto del video finale (audio escluso): il file resta in memoria e va scaricato
+
+
+def rate_cap(raw_path, max_sec):
+    """Tetto di bitrate (bit/s): con grana e rumore il CRF da solo porta un render di 150 s a 200 MB.
+    Il tetto e' il minore tra 0,8 bit per pixel e quanto serve per restare sotto MAX_FILE_MB (mai sotto 1,5 Mbit/s)."""
+    cap = cv2.VideoCapture(raw_path)
+    w, h, fps, n = (cap.get(k) for k in (cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT,
+                                         cv2.CAP_PROP_FPS, cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    if w <= 0 or h <= 0 or fps <= 0:
+        return None
+    dur = min(float(max_sec), n / fps) if n > 0 else float(max_sec)
+    return int(max(1.5e6, min(w * h * fps * 0.8, MAX_FILE_MB * 8e6 / max(dur, 1.0))))
+
+
 def finalize_h264(raw_path, audio_src, final_path, keep_audio, max_sec):
-    """Re-encode in H.264 (compatibile browser) + audio opzionale dalla sorgente."""
+    """Re-encode in H.264 (compatibile browser, CRF 20 con tetto di bitrate) + audio opzionale dalla sorgente."""
     cmd = [FFMPEG, "-y", "-err_detect", "ignore_err", "-i", raw_path]
     if keep_audio:
         cmd += ["-t", str(max_sec), "-i", audio_src, "-map", "0:v:0", "-map", "1:a:0?"]
         cmd += ["-shortest"]
-    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
-            "-preset", "veryfast", "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart", final_path]
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", "-preset", "veryfast"]
+    rate = rate_cap(raw_path, max_sec)
+    if rate:
+        cmd += ["-maxrate", str(rate), "-bufsize", str(2 * rate)]
+    cmd += ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", final_path]
     subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -1054,18 +1145,23 @@ def byte_datamosh(src, src_b, out_avi, p):
     kfi = audio_keyframes(au["trig_drop"][:n_est], p["drop_thr"]) if p.get("kf_on_audio") else []
     p["kf_set"], p["protect"] = set(kfi), -1
     p["max_lag"] = max(2, int(round(fps * 0.3)))  # ritardo massimo dell'immagine sull'audio: 0,3 secondi
-    tmp = tempfile.mkdtemp()
-    path_a = os.path.join(tmp, "a.avi")
-    transcode_avi(src, path_a, w, h, fps, p, [k / fps for k in kfi])
-    frames = read_avi_frames(path_a)
+    tmp = workdir()
+    try:  # i frame vengono letti in memoria: la cartella serve solo qui dentro
+        path_a = os.path.join(tmp, "a.avi")
+        transcode_avi(src, path_a, w, h, fps, p, [k / fps for k in kfi])
+        frames = read_avi_frames(path_a)
+        fb = None
+        if src_b:
+            path_b = os.path.join(tmp, "b.avi")
+            transcode_avi(src_b, path_b, w, h, fps, p)
+            fb = read_avi_frames(path_b)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     if len(frames) < 3:
         raise RuntimeError("Troppi pochi frame / too few frames")
     n = len(frames)
 
     if src_b:  # transfer: l'I-frame di B (texture) + i P-frame di A (movimento)
-        path_b = os.path.join(tmp, "b.avi")
-        transcode_avi(src_b, path_b, w, h, fps, p)
-        fb = read_avi_frames(path_b)
         tyb = [vop_type(f) for f in fb]
         start_f = min(n - 1, int(n * p["mosh_start"] / 100))
         cand = [i for i, t in enumerate(tyb) if t == 0 and i <= start_f] or \
@@ -1244,7 +1340,7 @@ def databend_video(src_video, src_image, out_path, p, progress_cb=None):
 ACC = {"4/4": 4, "3/4": 3, "6/8": 6, "2/4": 2}
 
 DEFAULTS = {
-    "seed": 507, "mosh_range": (15, 100), "max_w": 640, "max_sec": 30, "prev_sec": 3,
+    "seed": 507, "mosh_range": (15, 100), "max_w": 640, "max_sec": 30, "len_mode": LEN_MODES[0], "prev_sec": 3,
     "keep_audio": True, "audio_mosh": False, "audio_mosh_amt": 1.0, "onset_thr": 0.6, "bloom_prob": 0.02, "trigger": "Onset",
     "bands": False, "bpm_manual": 0.0, "meter": "4/4", "beat_offset": 0, "downbeat": 1, "show_wave": False, "fmt": "Originale", "fit": "Ritaglia", "flow_engine": "DIS (veloce)",
     "kf": 12, "qscale": 5, "kf_on_audio": True, "drop_mode": "Su onset", "drop_thr": 0.5,
@@ -1269,16 +1365,16 @@ DEFAULTS = {
 for _p in ("mt2", "mt4"):  # trasformazioni del moto: stesse impostazioni, una copia per tab
     DEFAULTS.update({f"{_p}_{_k}": _v for _k, _v in MT_DEFAULTS.items()})
 
-KEEP = ("fmt", "fit", "beat_offset", "downbeat", "show_wave", "seed", "max_w", "max_sec", "prev_sec", "keep_audio", "audio_mosh", "audio_mosh_amt", "bpm_manual", "meter", "flow_engine")
+KEEP = ("fmt", "fit", "beat_offset", "downbeat", "show_wave", "seed", "max_w", "max_sec", "len_mode", "prev_sec", "keep_audio", "audio_mosh", "audio_mosh_amt", "bpm_manual", "meter", "flow_engine")
 
 OPTS = {"trigger": ["Onset", "Beat (a tempo)", "Onset + Beat"], "drop_mode": ["Su onset", "Tutti", "Mai"],
         "mode": ["Block MV", "Optical Flow"], "rs_block": [8, 16, 32, 64], "block": [8, 16, 32, 64], "meter": list(ACC),
-        "max_w": [320, 480, 640, 854, 1280], "fmt": FORMATS, "fit": FIT_MODES, "flow_engine": ["DIS (veloce)", "Farneback"], "ps_fps": [24, 25, 30], "ps_key": PS_KEYS, "ps_imode": PS_MODES, "ps_drv": DRIVERS,
+        "max_w": [320, 480, 640, 854, 1280], "len_mode": LEN_MODES, "fmt": FORMATS, "fit": FIT_MODES, "flow_engine": ["DIS (veloce)", "Farneback"], "ps_fps": [24, 25, 30], "ps_key": PS_KEYS, "ps_imode": PS_MODES, "ps_drv": DRIVERS,
         "db_fps": [24, 25, 30], "db_scan": ["Orizzontale", "Verticale", "Blocchi"],
         "db_space": ["BGR", "YCrCb"], "db_tile": [16, 32, 64],
         **{"db_d_" + k: DRIVERS for k in FX}}
 
-LIM = {"seed": (0, 2**31 - 1), "audio_mosh_amt": (0.0, 1.0), "mosh_range": (0, 100), "max_sec": (2, 180), "prev_sec": (2, 6),
+LIM = {"seed": (0, 2**31 - 1), "audio_mosh_amt": (0.0, 1.0), "mosh_range": (0, 100), "max_sec": (2, MAX_SEC), "prev_sec": (2, 6),
        "onset_thr": (0.1, 1.0), "bloom_prob": (0.0, 0.3), "bpm_manual": (0.0, 300.0), "beat_offset": (-300, 300), "downbeat": (1, 6),
        "kf": (6, 120), "qscale": (2, 15), "drop_thr": (0.1, 1.0), "max_dup": (1, 40),
        "corrupt": (0.0, 0.01), "quiet_thr": (0.0, 0.6), "strength": (0.2, 4.0), "mv_noise": (0.0, 8.0),
@@ -1617,7 +1713,7 @@ def mt_from_state(ss, pfx):
 def common_params(ss, preview=False):
     return {"seed": int(ss["seed"]), "mosh_start": ss["mosh_range"][0], "mosh_end": ss["mosh_range"][1],
             "max_w": int(min(ss["max_w"], 240) if preview else ss["max_w"]),
-            "max_sec": int(ss["prev_sec"] if preview else ss["max_sec"]),
+            "max_sec": int(ss["prev_sec"] if preview else eff_seconds(ss)),
             "onset_thr": ss["onset_thr"], "trigger": ss["trigger"], "bloom_prob": ss["bloom_prob"],
             "bands": ss["bands"], "bpm_manual": float(ss["bpm_manual"]), "meter": ss["meter"],
             "fmt": ss["fmt"], "fit": ss["fit"]}
@@ -1983,6 +2079,44 @@ if _in_streamlit():
     up_img = st.file_uploader("Immagine fissa opzionale (tab 3 Databending, 5 Pixel sort, 6 Catena: si anima col brano, serve l'audio esterno)",
                               type=["png", "jpg", "jpeg", "bmp", "webp"], key="img")
 
+    @st.cache_data(show_spinner=False, max_entries=16, ttl=3600)
+    def cached_seconds(key, _data, name, what):
+        """Durata (brano o video) di un upload, in cache: il file temporaneo nasce solo se non e' gia' noto."""
+        with tempfile.TemporaryDirectory(prefix=WORK_PREFIX) as td:
+            path = os.path.join(td, "in" + (os.path.splitext(name)[1] or ".bin"))
+            with open(path, "wb") as f:
+                f.write(_data)
+            return video_seconds(path) if what == "video" else media_seconds(path)
+
+
+    def upload_key(up):
+        return f"{up.name}:{getattr(up, 'size', 0)}:{getattr(up, 'file_id', '')}"
+
+
+    def current_seconds(mode=None, quiet=False):
+        """Secondi che verranno resi con le impostazioni attuali (e un avviso se il file e' piu' lungo del massimo)."""
+        ss = st.session_state
+        mode = mode or ss["len_mode"]
+        if mode == LEN_MODES[0]:
+            return int(ss["max_sec"])
+        src = up_au or up_a
+        song = cached_seconds(upload_key(src), src.getbuffer(), src.name, "media") if src is not None else None
+        video = cached_seconds(upload_key(up_a), up_a.getbuffer(), up_a.name, "video") if up_a is not None else None
+        want = song if mode == LEN_MODES[1] else video
+        if want is None:
+            if not quiet:
+                st.caption("Carica " + ("un audio o un video" if mode == LEN_MODES[1] else "il Video A")
+                           + ": intanto vale il cursore / upload it: the slider applies meanwhile.")
+            return int(ss["max_sec"])
+        sec = pick_seconds(ss, song, video)
+        if not quiet:
+            st.caption(f"{'Brano' if mode == LEN_MODES[1] else 'Video'} {fmt_time(want)} :: render di {fmt_time(sec)}"
+                       + (f" (limitato a {fmt_time(MAX_SEC)})" if want > MAX_SEC else ""))
+            if mode == LEN_MODES[1] and video is not None and video + 0.5 < sec:
+                st.caption(f"Il Video A dura {fmt_time(video)}: il render finisce con lui / the render ends with the video.")
+        return sec
+
+
     with st.sidebar:
         st.header("Comuni / Common")
         seed = st.number_input("Seed", 0, 2**31 - 1, key="seed")
@@ -1996,8 +2130,12 @@ if _in_streamlit():
                  help="Originale = come la sorgente. Gli altri portano video, Video B e immagine al formato scelto prima degli effetti.")
         st.radio("Adattamento al formato / Fit", OPTS["fit"], key="fit", horizontal=True,
                  help="Ritaglia = riempie il formato tagliando i bordi; Bordi neri = mostra tutta l'immagine.")
-        max_sec = st.slider("Durata max (s) / Max seconds", 2, 180, key="max_sec")
-        if max_sec > 60:
+        len_mode = st.radio("Durata / Length", OPTS["len_mode"], key="len_mode",
+                            help="Manuale = usa il cursore. Come il brano = tutta la durata dell'audio (quello esterno, altrimenti "
+                                 "quello del Video A). Come il video = tutta la durata del Video A. Massimo 3 minuti.")
+        st.slider("Durata max (s) / Max seconds", 2, MAX_SEC, key="max_sec", disabled=len_mode != LEN_MODES[0])
+        sel_sec = current_seconds(len_mode)
+        if sel_sec > 60:
             st.caption("Oltre 60 s il render puo' richiedere diversi minuti: prova prima con l'anteprima.")
         prev_sec = st.slider("Secondi anteprima / Preview seconds", 2, 6, key="prev_sec")
         keep_audio = st.checkbox("Mantieni audio (A o esterno) / Keep audio", key="keep_audio")
@@ -2024,8 +2162,16 @@ if _in_streamlit():
                 st.caption(st.session_state["pmsg"])
 
 
+    @st.cache_resource
+    def _sweep_once():
+        return sweep_workdirs()  # una volta per avvio: toglie le cartelle lasciate da render interrotti
+
+
+    _sweep_once()
+
+
     def save_uploads():
-        tmp = tempfile.mkdtemp()
+        tmp = workdir()
         out = []
         for up in (up_a, up_b, up_au, up_img):
             if up is None:
@@ -2040,13 +2186,21 @@ if _in_streamlit():
 
 
     @st.cache_data(show_spinner=False, max_entries=8, ttl=3600)
-    def cached_analysis(digest, _path, max_sec):
-        """Analisi audio pesante in cache: la chiave e' il contenuto del file, non i parametri del tempo."""
-        return analyze_audio(_path, max_sec)
+    def cached_analysis(digest, _src, max_sec):
+        """Analisi audio pesante in cache: la chiave e' il contenuto del file, non i parametri del tempo.
+        _src = percorso, oppure (nome, byte) di un upload: in quel caso il file temporaneo nasce solo se serve."""
+        if isinstance(_src, str):
+            return analyze_audio(_src, max_sec)
+        name, data = _src
+        with tempfile.TemporaryDirectory(prefix=WORK_PREFIX) as td:
+            path = os.path.join(td, "in" + (os.path.splitext(name)[1] or ".bin"))
+            with open(path, "wb") as f:
+                f.write(data)
+            return analyze_audio(path, max_sec)
 
 
     def file_digest(path):
-        h = hashlib.md5()
+        h = hashlib.md5(usedforsecurity=False)
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
@@ -2077,30 +2231,36 @@ if _in_streamlit():
     def prepare(kind, ss, preview):
         """Salva i file, li porta al formato scelto, controlla le combinazioni e calcola l'audio (dall'originale)."""
         tmp, pa, pb, pau, pi = save_uploads()
-        pi = pi if kind in ("DATABEND", "PIXELSORT", "CHAIN") else None  # l'immagine fissa serve solo a questi
-        if pi and not pau:
-            raise RuntimeError("Per animare l'immagine serve un audio esterno / an audio file is required")
-        first = kind
-        if kind == "CHAIN":
-            names = [ss[f"chain_{i}"] for i in range(3) if ss[f"chain_{i}"] != NONE]
-            if not names:
-                raise RuntimeError("Scegli almeno un effetto / pick at least one effect")
-            first = STEPS[names[0]]
-        img_fps = float(ss["db_fps"] if first == "DATABEND" else ss["ps_fps"]) if pi else None
-        cp = common_params(ss, preview)
-        au = au_for(pa, pau, cp["max_sec"], img_fps)
-        if pi and not au["ok"]:
-            raise RuntimeError("Audio non leggibile / audio unreadable")
-        src = {"tmp": tmp, "video": pa, "b": pb, "image": pi, "audio": pau or pa}
-        if cp["fmt"] != "Originale":
-            tw, th = format_size(cp["fmt"], cp["max_w"])
-            if pi:
-                src["image"] = format_image(pi, os.path.join(tmp, "fmt_img.png"), tw, th, cp["fit"])
-            elif pa:
-                src["video"] = format_video(pa, os.path.join(tmp, "fmt_a.avi"), tw, th, cp["fit"], cp["max_sec"])
-            if pb:
-                src["b"] = format_video(pb, os.path.join(tmp, "fmt_b.avi"), tw, th, cp["fit"], cp["max_sec"])
-        return src, au
+        try:
+            pi = pi if kind in ("DATABEND", "PIXELSORT", "CHAIN") else None  # l'immagine fissa serve solo a questi
+            if pi and not pau:
+                raise RuntimeError("Per animare l'immagine serve un audio esterno / an audio file is required")
+            first = kind
+            if kind == "CHAIN":
+                names = [ss[f"chain_{i}"] for i in range(3) if ss[f"chain_{i}"] != NONE]
+                if not names:
+                    raise RuntimeError("Scegli almeno un effetto / pick at least one effect")
+                first = STEPS[names[0]]
+            img_fps = float(ss["db_fps"] if first == "DATABEND" else ss["ps_fps"]) if pi else None
+            song = media_seconds(pau or pa) if (pau or pa) else None  # brano = audio esterno, altrimenti l'audio del Video A
+            ss["eff_sec"] = pick_seconds(ss, song, video_seconds(pa) if pa else None)
+            cp = common_params(ss, preview)
+            au = au_for(pa, pau, cp["max_sec"], img_fps)
+            if pi and not au["ok"]:
+                raise RuntimeError("Audio non leggibile / audio unreadable")
+            src = {"tmp": tmp, "video": pa, "b": pb, "image": pi, "audio": pau or pa}
+            if cp["fmt"] != "Originale":
+                tw, th = format_size(cp["fmt"], cp["max_w"])
+                if pi:
+                    src["image"] = format_image(pi, os.path.join(tmp, "fmt_img.png"), tw, th, cp["fit"])
+                elif pa:
+                    src["video"] = format_video(pa, os.path.join(tmp, "fmt_a.avi"), tw, th, cp["fit"], cp["max_sec"])
+                if pb:
+                    src["b"] = format_video(pb, os.path.join(tmp, "fmt_b.avi"), tw, th, cp["fit"], cp["max_sec"])
+            return src, au
+        except Exception:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
 
 
     def render(kind, ss, preview, src, au, cb=None):
@@ -2127,25 +2287,32 @@ if _in_streamlit():
 
     def run_effect(kind, preview):
         """Un effetto (tab 1-5) o la catena (kind = "CHAIN", tab 6): render, download e report."""
+        tmp = None
         try:
             ss = st.session_state
             src, au = prepare(kind, ss, preview)
+            tmp = src["tmp"]
             bar = st.progress(0.0)
             with st.spinner("Elaborazione / Processing..."):
                 final, k, p, fps, stt = render(kind, ss, preview, src, au, lambda v: bar.progress(min(1.0, v)))
             bar.empty()
-            publish(final, k, p, fps, stt, preview)
+            publish(final, k, p, fps, stt, preview)  # il video finale e' gia' in memoria: la cartella non serve piu'
             return True
         except Exception as e:  # noqa: BLE001
             st.error(f"Errore / Error :: {e}")
             return False
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
 
 
     def run_variants(kind):
         """Quattro anteprime con semi diversi (il primo e' quello attuale): scegli la migliore con un clic."""
+        tmp = None
         try:
             ss = st.session_state
             src, au = prepare(kind, ss, True)
+            tmp = src["tmp"]
             rng = random.Random(int(ss["seed"]))
             seeds = [int(ss["seed"])] + [rng.randrange(2 ** 31) for _ in range(3)]
             base = {k: ss[k] for k in DEFAULTS}
@@ -2163,6 +2330,9 @@ if _in_streamlit():
             st.session_state["dm_variants"] = {"kind": kind, "items": items}
         except Exception as e:  # noqa: BLE001
             st.error(f"Errore / Error :: {e}")
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
 
 
     def use_seed(seed):
@@ -2187,11 +2357,10 @@ if _in_streamlit():
             st.info("Carica un audio o un video per vedere la forma d'onda.")
             return
         ss = st.session_state
-        path = os.path.join(tempfile.mkdtemp(), up.name)
-        with open(path, "wb") as f:
-            f.write(up.getbuffer())
-        fps, msec = 30.0, int(ss["max_sec"])
-        au = features_from_analysis(cached_analysis(file_digest(path), path, msec), fps, int(msec * fps) + 2,
+        data = up.getbuffer()
+        fps, msec = 30.0, current_seconds(quiet=True)
+        digest = hashlib.md5(data, usedforsecurity=False).hexdigest()
+        au = features_from_analysis(cached_analysis(digest, (up.name, data), msec), fps, int(msec * fps) + 2,
                                     float(ss["bpm_manual"]), ACC[ss["meter"]], ss["beat_offset"] / 1000.0,
                                     int(ss["downbeat"]) - 1)
         if not au["ok"]:
@@ -2408,7 +2577,7 @@ if _in_streamlit():
             col.selectbox(f"Passo {i + 1}", OPTS[f"chain_{i}"], key=f"chain_{i}")
         chain_names = [st.session_state[f"chain_{i}"] for i in range(3) if st.session_state[f"chain_{i}"] != NONE]
         st.caption(" > ".join(chain_names) if chain_names else "Scegli almeno un effetto.")
-        if len(chain_names) >= 2 and st.session_state["max_sec"] > 60:
+        if len(chain_names) >= 2 and sel_sec > 60:
             st.warning("Catena + durata oltre 60 s: il render puo' richiedere molti minuti. Prova prima con l'anteprima.")
         r1, r2, r3 = st.columns(3)
         nodata6 = (up_a is None and up_img is None) or not chain_names
